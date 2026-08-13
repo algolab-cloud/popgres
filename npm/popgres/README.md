@@ -10,5 +10,5 @@ This package installs the prebuilt `popgres` binary for the current platform as
 an optional dependency and launches it directly. It runs no install scripts and
 does not require a Rust toolchain.
 
-See the [project README](https://github.com/ericmaro/popgres#readme) for commands,
+See the [project README](https://github.com/algolab-cloud/popgres#readme) for commands,
 configuration, and source installation instructions.

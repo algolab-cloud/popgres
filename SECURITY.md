@@ -9,7 +9,7 @@ popgres is pre-1.0. Security fixes land on the latest release only.
 Please **do not** open a public issue.
 
 Report privately through
-[GitHub Security Advisories](https://github.com/ericmaro/popgres/security/advisories/new).
+[GitHub Security Advisories](https://github.com/algolab-cloud/popgres/security/advisories/new).
 
 Include what you can: affected version, platform, reproduction steps, and impact.
 You can expect an acknowledgement within a few days and an assessment shortly

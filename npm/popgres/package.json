@@ -9,10 +9,10 @@
     "dev",
     "ephemeral"
   ],
-  "homepage": "https://github.com/ericmaro/popgres#readme",
+  "homepage": "https://github.com/algolab-cloud/popgres#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ericmaro/popgres.git"
+    "url": "git+https://github.com/algolab-cloud/popgres.git"
   },
   "license": "MIT",
   "bin": {

@@ -76,7 +76,7 @@ The npm package is a tiny launcher plus one prebuilt binary per platform
 (`@popgres/darwin-arm64`, `@popgres/linux-x64`, …) declared as
 `optionalDependencies`, so your package manager downloads only the one your
 machine needs. No postinstall scripts, no Rust toolchain required. Prebuilt
-binaries are also attached to each [GitHub release](https://github.com/ericmaro/popgres/releases).
+binaries are also attached to each [GitHub release](https://github.com/algolab-cloud/popgres/releases).
 
 ## Try it (from source)
 

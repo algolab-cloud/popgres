@@ -46,7 +46,7 @@ for (const target of TARGETS) {
         license: "MIT",
         repository: {
           type: "git",
-          url: "git+https://github.com/ericmaro/popgres.git",
+          url: "git+https://github.com/algolab-cloud/popgres.git",
         },
         os: [target.os],
         cpu: [target.cpu],
