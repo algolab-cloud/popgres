@@ -52,9 +52,10 @@ Please keep the working tree free of `cargo fmt` noise unrelated to your change.
 
 ## Code conventions
 
-- `src/main.rs` holds the CLI surface (clap `Command` enum) and command handlers;
-  `src/state.rs` owns the per-project state file and paths. Keep new persistence
-  logic in `state.rs` rather than inlining paths in command handlers.
+- `src/main.rs` holds the clap CLI surface, `src/commands.rs` holds command
+  handlers, and the remaining modules own their corresponding domain logic.
+  Keep new persistence logic in `src/state.rs` rather than inlining paths in
+  command handlers.
 - Errors use `anyhow` — attach context with `.context("what we were trying to do")`
   instead of bubbling bare I/O errors.
 - Every user-facing command must support `--json`, and the JSON must stay stable:
