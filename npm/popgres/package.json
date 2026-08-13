@@ -1,5 +1,5 @@
 {
-  "name": "popgres",
+  "name": "@popgres/cli",
   "version": "0.1.0",
   "description": "Disposable Postgres for every project — pops up when you start, pops away when you stop. No install, no Docker.",
   "keywords": [

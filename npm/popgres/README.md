@@ -3,7 +3,7 @@
 Disposable Postgres for local development, with no system install or Docker.
 
 ```sh
-npx popgres run -- npm run dev
+npx @popgres/cli run -- npm run dev
 ```
 
 This package installs the prebuilt `popgres` binary for the current platform as

@@ -66,14 +66,14 @@ popgres identifies a project by its root — the nearest directory up the tree w
 ## Install
 
 ```
-npx popgres up              # zero-install, one-off
-pnpm dlx popgres up         # same, pnpm-style
-pnpm add -D popgres         # per-project devDependency
-cargo install popgres       # if you'd rather build it
+npx @popgres/cli up          # zero-install, one-off
+pnpm dlx @popgres/cli up     # same, pnpm-style
+pnpm add -D @popgres/cli     # per-project devDependency
+cargo install popgres        # if you'd rather build it
 ```
 
-The npm package is a tiny launcher plus one prebuilt binary per platform
-(`@popgres/darwin-arm64`, `@popgres/linux-x64`, …) declared as
+The `@popgres/cli` npm package is a tiny launcher plus one prebuilt binary per
+platform (`@popgres/darwin-arm64`, `@popgres/linux-x64`, …) declared as
 `optionalDependencies`, so your package manager downloads only the one your
 machine needs. No postinstall scripts, no Rust toolchain required. Prebuilt
 binaries are also attached to each [GitHub release](https://github.com/algolab-cloud/popgres/releases).
