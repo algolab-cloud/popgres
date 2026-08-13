@@ -1,0 +1,155 @@
+name: Release
+
+# Tag a version to ship it:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: version
+        name: Match the tag to Cargo.toml
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "popgres") | .version')"
+          if [ "$version" != "$crate_version" ]; then
+            echo "tag version $version does not match Cargo.toml version $crate_version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage the binary
+        shell: bash
+        run: |
+          mkdir -p "artifacts/${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/popgres.exe" "artifacts/${{ matrix.target }}/"
+          else
+            cp "target/${{ matrix.target }}/release/popgres" "artifacts/${{ matrix.target }}/"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: popgres-${{ matrix.target }}
+          path: artifacts/${{ matrix.target }}
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: popgres-*
+      - name: Pack one archive per target
+        run: |
+          mkdir -p dist
+          for dir in artifacts/popgres-*; do
+            target="${dir#artifacts/popgres-}"
+            case "$target" in
+              *windows*) (cd "$dir" && zip -r - .) > "dist/popgres-$target.zip" ;;
+              *) chmod +x "$dir/popgres" && tar -czf "dist/popgres-$target.tar.gz" -C "$dir" . ;;
+            esac
+          done
+          (cd dist && sha256sum ./* > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  publish-crate:
+    name: cargo publish
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-npm:
+    name: npm publish
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          pattern: popgres-*
+      - name: Flatten artifacts to target triples
+        run: |
+          mkdir -p artifacts
+          for dir in staging/popgres-*; do
+            mv "$dir" "artifacts/${dir#staging/popgres-}"
+          done
+      - name: Build the packages
+        run: node npm/build.mjs "${{ needs.verify.outputs.version }}" artifacts
+      - name: Publish
+        # Platform packages first: the wrapper depends on them existing.
+        run: |
+          publish_if_missing() {
+            pkg="$1"
+            name="$(node -p "require('./$pkg/package.json').name")"
+            version="$(node -p "require('./$pkg/package.json').version")"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published"
+            else
+              npm publish "./$pkg" --access public --provenance
+            fi
+          }
+          for pkg in npm/darwin-arm64 npm/darwin-x64 npm/linux-arm64 npm/linux-x64 npm/win32-x64; do
+            publish_if_missing "$pkg"
+          done
+          publish_if_missing npm/popgres
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

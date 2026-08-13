@@ -7,6 +7,9 @@ license = "MIT"
 repository = "https://github.com/ericmaro/popgres"
 keywords = ["postgres", "postgresql", "database", "dev", "ephemeral"]
 categories = ["command-line-utilities", "database"]
+readme = "README.md"
+# The crate tarball is the Rust source; npm packaging and CI don't belong in it.
+exclude = ["npm/", ".github/", "PLAN.md"]
 
 [dependencies]
 anyhow = "1"

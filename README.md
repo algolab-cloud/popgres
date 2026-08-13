@@ -63,6 +63,21 @@ popgres identifies a project by its root — the nearest directory up the tree w
 `popgres.toml`, or failing that a `.git`. So `popgres up` in the repo root and
 `popgres url` three directories down talk about the same instance.
 
+## Install
+
+```
+npx popgres up              # zero-install, one-off
+pnpm dlx popgres up         # same, pnpm-style
+pnpm add -D popgres         # per-project devDependency
+cargo install popgres       # if you'd rather build it
+```
+
+The npm package is a tiny launcher plus one prebuilt binary per platform
+(`@popgres/darwin-arm64`, `@popgres/linux-x64`, …) declared as
+`optionalDependencies`, so your package manager downloads only the one your
+machine needs. No postinstall scripts, no Rust toolchain required. Prebuilt
+binaries are also attached to each [GitHub release](https://github.com/ericmaro/popgres/releases).
+
 ## Try it (from source)
 
 ```
