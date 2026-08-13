@@ -116,6 +116,13 @@ every start after that is seconds. If you hit GitHub API rate limits, set a
 See [PLAN.md](PLAN.md) for planned named instances, TTL auto-disposal for
 agents, one-off SQL execution, MCP server mode, and additional binary targets.
 
+## AI agents
+
+The repository includes a reusable [popgres agent skill](skills/popgres/SKILL.md)
+that teaches compatible agents to provision PostgreSQL for tests and migrations,
+pass connection details safely, preserve pre-existing instances, and guarantee
+cleanup of disposable data.
+
 ## Contributing
 
 Bug reports and PRs are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md).
