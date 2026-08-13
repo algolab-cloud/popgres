@@ -1,0 +1,41 @@
+name: Bug report
+description: Something popgres did wrong
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        The exact commands you ran and their output. Add `--json` if the command
+        supports it. If Postgres failed to start, include the instance log from
+        the project state dir.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: popgres version
+      description: Output of `popgres --version` (or the commit you built from).
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: macOS 15.5 arm64 / Ubuntu 24.04 x86_64 / Windows 11 x86_64
+    validations:
+      required: true
+  - type: input
+    id: pg-version
+    attributes:
+      label: PostgreSQL version
+      description: From `popgres status`, if the instance got far enough to report one.

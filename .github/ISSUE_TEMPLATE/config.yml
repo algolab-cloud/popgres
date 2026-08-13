@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ericmaro/popgres/security/advisories/new
+    about: Report privately — please don't open a public issue.
+  - name: Question or idea
+    url: https://github.com/ericmaro/popgres/discussions
+    about: Ask about usage or float an idea before it's a feature request.

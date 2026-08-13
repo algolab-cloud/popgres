@@ -1,0 +1,8 @@
+/target
+
+# Local env files popgres may write (they contain the instance password)
+.env
+.env.local
+
+# OS cruft
+.DS_Store

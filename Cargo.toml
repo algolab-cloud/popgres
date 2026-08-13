@@ -1,0 +1,28 @@
+[package]
+name = "popgres"
+version = "0.1.0"
+edition = "2021"
+description = "Disposable Postgres for every project — pops up when you start, pops away when you stop. No install, no Docker."
+license = "MIT"
+repository = "https://github.com/ericmaro/popgres"
+keywords = ["postgres", "postgresql", "database", "dev", "ephemeral"]
+categories = ["command-line-utilities", "database"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+postgresql_embedded = "0.21"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal"] }
+toml = "1.1.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
