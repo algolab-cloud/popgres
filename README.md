@@ -4,6 +4,10 @@ Disposable Postgres for every project — pops up when you start, pops away when
 
 No system install. No Docker. Real PostgreSQL binaries are downloaded once (per version), cached globally, and run as a plain local process on a free port.
 
+Available from [npm](https://www.npmjs.com/package/@popgres/cli),
+[crates.io](https://crates.io/crates/popgres), and as prebuilt binaries on the
+[GitHub releases page](https://github.com/algolab-cloud/popgres/releases).
+
 ```
 popgres run -- npm run dev   # DB lives exactly as long as your dev process
 popgres up                   # start this project's Postgres, prints DATABASE_URL
@@ -65,11 +69,26 @@ popgres identifies a project by its root — the nearest directory up the tree w
 
 ## Install
 
+Use npm for a prebuilt binary with no Rust toolchain:
+
+```sh
+npx @popgres/cli up                    # zero-install, one-off
+npm install --save-dev @popgres/cli    # install in a project
+npx popgres run -- npm run dev         # use the project install
 ```
-npx @popgres/cli up          # zero-install, one-off
-pnpm dlx @popgres/cli up     # same, pnpm-style
-pnpm add -D @popgres/cli     # per-project devDependency
-cargo install popgres        # if you'd rather build it
+
+The equivalent pnpm commands are:
+
+```sh
+pnpm dlx @popgres/cli up
+pnpm add --save-dev @popgres/cli
+pnpm popgres run -- pnpm dev
+```
+
+Or install from crates.io with Rust:
+
+```sh
+cargo install popgres
 ```
 
 The `@popgres/cli` npm package is a tiny launcher plus one prebuilt binary per
@@ -94,9 +113,8 @@ every start after that is seconds. If you hit GitHub API rate limits, set a
 
 ## Roadmap
 
-See [PLAN.md](PLAN.md) — including `popgres run -- <cmd>` (DB lives exactly as
-long as your dev process), seeding, TTL auto-disposal for agents, MCP server
-mode, and npm/npx distribution.
+See [PLAN.md](PLAN.md) for planned named instances, TTL auto-disposal for
+agents, one-off SQL execution, MCP server mode, and additional binary targets.
 
 ## Contributing
 

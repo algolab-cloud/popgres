@@ -77,16 +77,18 @@ grace period and killing it — needs a `libc`/`nix` dependency.
 archives and checksums, `cargo publish`, and npm packages built by
 `npm/build.mjs` — one `@popgres/<platform>` package per target plus a launcher
 that declares them as `optionalDependencies`, so no postinstall script runs and
-no Rust toolchain is needed. Untested end to end until the first tag. Before
-then, publish the package names once interactively and configure npm and
-crates.io Trusted Publishers for `release.yml`; both registries use short-lived
-GitHub OIDC credentials, so no registry tokens are stored as repository
-secrets. Still open: a `bundled` build for offline installs, and musl/Alpine
-binaries.
+no Rust toolchain is needed. The pipeline shipped `v0.1.0` end to end to
+[GitHub Releases](https://github.com/algolab-cloud/popgres/releases),
+[crates.io](https://crates.io/crates/popgres), and
+[npm](https://www.npmjs.com/package/@popgres/cli). npm and crates.io enforce
+Trusted Publishing from `release.yml`; both registries use short-lived GitHub
+OIDC credentials, so no registry tokens are stored as repository secrets.
+Still open: a `bundled` build for offline installs, and musl/Alpine binaries.
 
 ## Caveats
 
 - The first run for a given Postgres version needs network access; later starts
   take a second or two from cache.
-- Only tested on macOS. Windows has no POSIX signals, so `run`'s teardown needs
-  checking there.
+- CI builds and tests the CLI on macOS, Linux, and Windows. The full PostgreSQL
+  lifecycle has primarily been exercised on macOS; Windows has no POSIX
+  signals, so `run`'s teardown needs additional platform-specific testing.
