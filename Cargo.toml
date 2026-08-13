@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Disposable Postgres for every project — pops up when you start, pops away when you stop. No install, no Docker."
 license = "MIT"
-repository = "https://github.com/ericmaro/popgres"
+repository = "https://github.com/algolab-cloud/popgres"
 keywords = ["postgres", "postgresql", "database", "dev", "ephemeral"]
 categories = ["command-line-utilities", "database"]
+readme = "README.md"
+# The crate tarball is the Rust source; npm packaging and CI don't belong in it.
+exclude = ["npm/", ".github/", "PLAN.md"]
 
 [dependencies]
 anyhow = "1"

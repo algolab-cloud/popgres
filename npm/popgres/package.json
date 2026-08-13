@@ -1,0 +1,35 @@
+{
+  "name": "@popgres/cli",
+  "version": "0.1.0",
+  "description": "Disposable Postgres for every project — pops up when you start, pops away when you stop. No install, no Docker.",
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "database",
+    "dev",
+    "ephemeral"
+  ],
+  "homepage": "https://github.com/algolab-cloud/popgres#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/algolab-cloud/popgres.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "popgres": "bin/popgres.js"
+  },
+  "files": [
+    "bin/popgres.js",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@popgres/darwin-arm64": "0.1.0",
+    "@popgres/darwin-x64": "0.1.0",
+    "@popgres/linux-arm64": "0.1.0",
+    "@popgres/linux-x64": "0.1.0",
+    "@popgres/win32-x64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -72,10 +72,16 @@ processes when it forgets to clean up.
 **Teardown.** Forward SIGTERM to the child on signal instead of waiting out the
 grace period and killing it — needs a `libc`/`nix` dependency.
 
-**Distribution.** Prebuilt binaries via `cargo-dist` / GitHub Releases, and npm
-using the platform-specific `optionalDependencies` pattern (as esbuild and Biome
-do) so `npx popgres run -- npm run dev` works with no Rust toolchain. Optional
-`bundled` build for offline installs.
+**Distribution.** Wired up in `.github/workflows/release.yml`, triggered by a
+`v*` tag: a build matrix over five targets, a GitHub release with per-target
+archives and checksums, `cargo publish`, and npm packages built by
+`npm/build.mjs` — one `@popgres/<platform>` package per target plus a launcher
+that declares them as `optionalDependencies`, so no postinstall script runs and
+no Rust toolchain is needed. Untested end to end until the first tag. Before
+then, publish the package names once interactively and configure each package's
+npm Trusted Publisher for `release.yml`; crates.io still needs the
+`CARGO_REGISTRY_TOKEN` GitHub Actions repository secret. Still open: a `bundled`
+build for offline installs, and musl/Alpine binaries.
 
 ## Caveats
 
