@@ -1,133 +1,87 @@
 # popgres
 
-Disposable Postgres for every project — pops up when you start, pops away when you stop.
+Disposable PostgreSQL for local development and tests. No Docker or system-wide
+Postgres installation required.
 
-No system install. No Docker. Real PostgreSQL binaries are downloaded once (per version), cached globally, and run as a plain local process on a free port.
-
-Available from [npm](https://www.npmjs.com/package/@popgres/cli),
-[crates.io](https://crates.io/crates/popgres), and as prebuilt binaries on the
-[GitHub releases page](https://github.com/algolab-cloud/popgres/releases).
-
-```
-popgres run -- npm run dev   # DB lives exactly as long as your dev process
-popgres up                   # start this project's Postgres, prints DATABASE_URL
-popgres status               # running? which version, which port?
-popgres url                  # print the connection string
-popgres psql                 # open a psql shell into the instance
-popgres reset                # wipe the data and start fresh
-popgres down                 # stop and wipe — poof!
-popgres down --keep          # stop but keep the data for next time
-popgres down --wipe          # stop and wipe even if it was set to keep
+```sh
+npx @popgres/cli run -- npm test
 ```
 
-`popgres run` is the one to reach for: it starts Postgres, hands your command a
-`DATABASE_URL` (plus `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`), and
-disposes of the database when the command exits — Ctrl-C included. It exits with
-your command's exit code, so it drops into a `package.json` script or CI job as-is:
-
-```json
-{ "scripts": { "dev": "popgres run -- vite dev" } }
-```
-
-Most commands support `--json` for scripts and AI agents.
-
-## Configuring a project
-
-Everything works with no config at all. Drop a `popgres.toml` in your project root
-when you want to pin things down — every key is optional, and a command-line flag
-always wins over the file:
-
-```toml
-pg_version = "18"        # default: latest stable
-database = "db"          # created on first start
-password = "hunter2"     # omit for no password at all (the default)
-port = 0                 # 0 = pick a free port each run
-keep = false             # persist data between runs
-seed = "./db/seed.sql"   # run once, after a fresh initdb
-env_file = ".env.local"  # write DATABASE_URL here while the instance is up
-```
-
-By default the database is called `db` and takes **no password**, so the URL is
-just `postgresql://postgres@127.0.0.1:<port>/db` — nothing secret to leak into a
-log, a screenshot, or an agent's context. The server listens on loopback only and
-dies with the project. Set `password` if you want authentication anyway; popgres
-then requires it for real (`database` and `password` apply to a fresh database —
-an existing one keeps the name and credentials it was created with).
-
-`seed` is either a `.sql` file (fed to psql, stopping on the first error) or any
-shell command — `"npm run migrate"`, `"sqlx migrate run"` — which gets the same
-environment as `popgres run`. It runs only on a genuinely fresh database, never
-over data you resumed with `--keep`.
-
-`env_file` is rewritten in place: popgres replaces the `DATABASE_URL` line, leaves
-your other variables alone, and removes the line again on `down`. The file holds a
-password, so popgres creates it `0600` — keep it out of version control.
-
-popgres identifies a project by its root — the nearest directory up the tree with a
-`popgres.toml`, or failing that a `.git`. So `popgres up` in the repo root and
-`popgres url` three directories down talk about the same instance.
+Popgres starts a real PostgreSQL instance, sets `DATABASE_URL` and the standard
+`PG*` variables for your command, then stops and wipes the database when the
+command exits. PostgreSQL binaries are downloaded on first use and cached.
 
 ## Install
 
-Use npm for a prebuilt binary with no Rust toolchain:
+Run without installing:
 
 ```sh
-npx @popgres/cli up                    # zero-install, one-off
-npm install --save-dev @popgres/cli    # install in a project
-npx popgres run -- npm run dev         # use the project install
+npx @popgres/cli up
 ```
 
-The equivalent pnpm commands are:
+Install in a Node.js project:
 
 ```sh
-pnpm dlx @popgres/cli up
-pnpm add --save-dev @popgres/cli
-pnpm popgres run -- pnpm dev
+npm install --save-dev @popgres/cli
+npx popgres run -- npm run dev
 ```
 
-Or install from crates.io with Rust:
+Or install with Cargo:
 
 ```sh
 cargo install popgres
 ```
 
-The `@popgres/cli` npm package is a tiny launcher plus one prebuilt binary per
-platform (`@popgres/darwin-arm64`, `@popgres/linux-x64`, …) declared as
-`optionalDependencies`, so your package manager downloads only the one your
-machine needs. No postinstall scripts, no Rust toolchain required. Prebuilt
-binaries are also attached to each [GitHub release](https://github.com/algolab-cloud/popgres/releases).
+Prebuilt npm binaries support macOS ARM64/x64, Linux glibc ARM64/x64, and
+Windows x64. Standalone archives are available on
+[GitHub Releases](https://github.com/algolab-cloud/popgres/releases).
 
-## Try it (from source)
+## Commands
 
+| Command | Purpose |
+| --- | --- |
+| `popgres run -- <command>` | Run a command with a disposable database |
+| `popgres up` | Start this project's database |
+| `popgres status` | Show its status, version, and port |
+| `popgres url` | Print its connection URL |
+| `popgres psql` | Open a `psql` shell |
+| `popgres reset` | Wipe and recreate the database |
+| `popgres down` | Stop and wipe the database |
+| `popgres down --keep` | Stop and preserve its data |
+
+Use `--json` with `up`, `status`, `reset`, and `down` for automation.
+
+## Configuration
+
+Popgres works without configuration. Add `popgres.toml` at the project root
+when you need explicit settings:
+
+```toml
+pg_version = "18"        # default: latest stable
+database = "db"          # default: db
+port = 0                 # choose a free port
+keep = false             # wipe data when stopped
+seed = "./db/seed.sql"   # run after fresh initialization
+env_file = ".env.local"  # write DATABASE_URL while running
 ```
-cargo run -- up
-cargo run -- status
-cargo run -- psql -- -c "select version()"
-cargo run -- down
-```
 
-The first ever `up` downloads PostgreSQL (~30 MB) from
-[theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries);
-every start after that is seconds. If you hit GitHub API rate limits, set a
-`GITHUB_TOKEN` environment variable.
-
-## Roadmap
-
-See [PLAN.md](PLAN.md) for planned named instances, TTL auto-disposal for
-agents, one-off SQL execution, MCP server mode, and additional binary targets.
+The default instance is passwordless and listens only on loopback. Set
+`password` in `popgres.toml` when authentication is required. Keep configured
+environment files out of version control.
 
 ## AI agents
 
-The repository includes a reusable [popgres agent skill](skills/popgres/SKILL.md)
-that teaches compatible agents to provision PostgreSQL for tests and migrations,
-pass connection details safely, preserve pre-existing instances, and guarantee
-cleanup of disposable data.
+Use the reusable [popgres agent skill](skills/popgres/SKILL.md) to help coding
+agents provision databases, run migrations and tests, protect connection
+details, preserve existing instances, and clean up safely.
 
-## Contributing
+## Links
 
-Bug reports and PRs are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md).
-Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
-Found a security issue? See [SECURITY.md](SECURITY.md).
+- [npm](https://www.npmjs.com/package/@popgres/cli)
+- [crates.io](https://crates.io/crates/popgres)
+- [Roadmap](PLAN.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
 
 ## License
 
