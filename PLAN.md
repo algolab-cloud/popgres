@@ -78,9 +78,10 @@ archives and checksums, `cargo publish`, and npm packages built by
 `npm/build.mjs` — one `@popgres/<platform>` package per target plus a launcher
 that declares them as `optionalDependencies`, so no postinstall script runs and
 no Rust toolchain is needed. Untested end to end until the first tag. Before
-then, create the public `@popgres` organization on npm and add
-`CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` as GitHub Actions repository secrets.
-Still open: a `bundled` build for offline installs, and musl/Alpine binaries.
+then, publish the package names once interactively and configure each package's
+npm Trusted Publisher for `release.yml`; crates.io still needs the
+`CARGO_REGISTRY_TOKEN` GitHub Actions repository secret. Still open: a `bundled`
+build for offline installs, and musl/Alpine binaries.
 
 ## Caveats
 
