@@ -1,0 +1,4 @@
+interface:
+  display_name: "Popgres"
+  short_description: "Run disposable PostgreSQL for agent tasks"
+  default_prompt: "Use $popgres to run my task against a disposable PostgreSQL database."

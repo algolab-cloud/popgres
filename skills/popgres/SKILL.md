@@ -1,0 +1,116 @@
+---
+name: popgres
+description: Run disposable local PostgreSQL instances with popgres for development, tests, migrations, schema work, and commands that need DATABASE_URL. Use when an agent is asked to use or install popgres, create an isolated PostgreSQL database, run a task against real local Postgres without Docker, seed or inspect a popgres project, or safely clean up a temporary database.
+---
+
+# Popgres
+
+Use popgres to give a project a real local PostgreSQL instance without a system
+Postgres installation or Docker. Prefer lifecycle-scoped commands and preserve
+instances or data that existed before the task.
+
+## Choose the invocation
+
+1. Run `command -v popgres`.
+2. If installed, invoke `popgres` directly.
+3. Otherwise, if Node.js is available, invoke `npx --yes @popgres/cli` without
+   adding a dependency to the project.
+4. If neither is available, ask before installing a persistent dependency or
+   toolchain. Supported installs are `npm install --save-dev @popgres/cli` and
+   `cargo install popgres`.
+
+Run commands from the intended project directory. Popgres identifies the
+project using the nearest `popgres.toml`, then the nearest `.git` root, then the
+current directory.
+
+## Prefer scoped execution
+
+For a test, migration, development server, or other single command, run:
+
+```sh
+popgres run -- <command> [arguments...]
+```
+
+For example:
+
+```sh
+popgres run -- npm test
+popgres run -- cargo test
+popgres run -- npm run migrate
+```
+
+Popgres injects `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and
+`PGDATABASE` into the child, forwards its exit code, and tears down an instance
+that it created. It reuses and leaves alone an instance that was already
+running. Keep popgres options before `--`; everything after `--` belongs to the
+child command.
+
+Do not add `--keep` unless the user requests persistent data. Check
+`popgres.toml` before promising disposal because `keep = true` also preserves
+data.
+
+## Coordinate multiple commands
+
+Prefer one project script that performs migrations, tests, and other dependent
+steps, then run that script through `popgres run`.
+
+If separate commands must share an instance:
+
+1. Check `popgres status --json`.
+2. Start with `popgres up --json` and retain its output without printing it.
+3. Read `url` for child-process environments and `already_running` for cleanup.
+4. Run every dependent command with `DATABASE_URL` set.
+5. If `already_running` is `false`, call `popgres down --json` in a guaranteed
+   cleanup path. If it is `true`, leave the instance running.
+
+Never wipe an instance that was already running. Never use `down --wipe` or
+`reset` unless disposing of the data is explicitly intended.
+
+## Use machine-readable output
+
+Prefer JSON for automation:
+
+- `up --json`: `url`, `host`, `port`, `database`, `already_running`
+- `status --json`: `running`, `port`, `pg_version`, `keep`
+- `down --json`: `stopped`, `wiped`
+- `reset --json`: `reset`, `url`, `port`, `database`
+
+`run`, `url`, and `psql` do not support `--json`. Treat `url` and JSON fields
+containing `url` as secrets because a configured password may be embedded.
+Pass connection values through environment variables; do not echo them into
+logs, chat, or command arguments.
+
+## Configure only when needed
+
+Create or edit `popgres.toml` only when the user needs reproducible project
+settings. Every key is optional:
+
+```toml
+pg_version = "18"
+database = "db"
+password = "change-me"
+port = 0
+keep = false
+seed = "./db/seed.sql"
+env_file = ".env.local"
+```
+
+Use `port = 0` for collision-free allocation. Omit `password` for the default
+passwordless loopback-only instance. A `seed` SQL file or shell command runs
+only after a fresh initialization. If using `env_file`, ensure it is ignored by
+version control; popgres removes its `DATABASE_URL` entry during teardown.
+
+## Inspect and recover
+
+- Use `popgres status --json` before assuming an instance exists.
+- Use `popgres psql -- <arguments>` for interactive or one-off `psql` work.
+- Use `popgres url` only when a tool cannot inherit the connection environment.
+- Use `popgres reset --json` only after confirming that all current data may be
+  destroyed.
+- Use `popgres down --keep` when stopping while preserving requested data.
+- Use `popgres down --wipe` only with explicit authorization to destroy kept
+  data.
+
+On failure, report the command and relevant stderr without exposing a
+connection URL or password. Attempt cleanup only for an instance created by the
+current task.
