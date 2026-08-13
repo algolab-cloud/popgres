@@ -71,9 +71,19 @@ environment files out of version control.
 
 ## AI agents
 
-Use the reusable [popgres agent skill](skills/popgres/SKILL.md) to help coding
-agents provision databases, run migrations and tests, protect connection
-details, preserve existing instances, and clean up safely.
+The reusable [popgres agent skill](skills/popgres/SKILL.md) works with Claude
+Code, Codex, Cursor, Gemini CLI, GitHub Copilot, OpenCode, and other tools that
+support the portable Agent Skills format. It helps agents provision databases,
+run migrations and tests, protect connection details, preserve existing
+instances, and clean up safely.
+
+Install it for every supported agent, including Claude Code:
+
+```sh
+npx skills add algolab-cloud/popgres --skill popgres --agent '*'
+```
+
+Add `--global` to make the skill available across all projects.
 
 ## Links
 
