@@ -1,6 +1,6 @@
 [package]
 name = "popgres"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Disposable Postgres for every project — pops up when you start, pops away when you stop. No install, no Docker."
 license = "MIT"

@@ -11,6 +11,18 @@ Popgres starts a real PostgreSQL instance, sets `DATABASE_URL` and the standard
 `PG*` variables for your command, then stops and wipes the database when the
 command exits. PostgreSQL binaries are downloaded on first use and cached.
 
+## Why popgres
+
+- **Real PostgreSQL.** Test against the same database engine you deploy, not an
+  in-memory substitute.
+- **No Docker daemon.** Popgres downloads a platform binary once and runs it as
+  an ordinary local process.
+- **Scoped cleanup.** `run` owns the database lifecycle, including command
+  failures and signals.
+- **Safe unattended use.** JSON output, stable exit codes, per-project locking,
+  verified liveness, optional TTLs, and global garbage collection support CI
+  jobs and AI agents.
+
 ## Install
 
 Run without installing:
@@ -30,6 +42,7 @@ Or install with Cargo:
 
 ```sh
 cargo install popgres
+popgres run -- cargo test
 ```
 
 Prebuilt npm binaries support macOS ARM64/x64, Linux glibc ARM64/x64, and
