@@ -18,6 +18,15 @@ use crate::ENV_VAR;
 const DEFAULT_DATABASE: &str = "db";
 const LOCALHOST: &str = "127.0.0.1";
 
+/// The seeded, connection-locked template every fresh database is cloned
+/// from. Fixed and unmistakably popgres's own, so it can never collide with
+/// a user's database name.
+pub const TEMPLATE_DB: &str = "popgres_template";
+
+/// The maintenance database used for create/drop statements — initdb always
+/// provides it, and it is never one popgres manages.
+pub const MAINTENANCE_DB: &str = "postgres";
+
 pub struct Started {
     pub state: InstanceState,
     /// We found it already running and adopted it, rather than starting it.
@@ -279,6 +288,53 @@ pub async fn stop(project: &Project, state: &InstanceState, keep: bool, json: bo
 /// which reset deliberately holds on to — between the stop and the start.
 pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Result<Started> {
     let _lock = StateLock::acquire(&project.state_dir, json)?;
+    let Some(current) = InstanceState::load(&project.state_dir)? else {
+        bail!("no popgres instance found for this project — run `popgres up` first");
+    };
+    if current != *state {
+        bail!("the popgres instance changed while waiting for the state lock — retry the command");
+    }
+
+    // A running instance resets without touching the postmaster: drop every
+    // popgres-managed database and let the caller rebuild the template and
+    // clone `db` from it. Same port, same URL, hundreds of milliseconds
+    // instead of a full initdb — and the seed hook still re-runs, so a
+    // changed seed takes effect. Anything else (stopped, unverifiable) takes
+    // the full stop-and-reinitialize path.
+    let extension_specs = crate::extensions::specs(&project.config)?;
+    let extensions_unchanged = crate::extensions::resume_compatible(
+        &current.extensions,
+        &current.installation_dir,
+        &current.pg_version,
+        &extension_specs,
+    );
+    if extensions_unchanged && matches!(probe(&current), Liveness::Running) {
+        let managed = psql_rows(
+            &current,
+            MAINTENANCE_DB,
+            "SELECT datname FROM pg_database \
+             WHERE datname NOT IN ('postgres', 'template0', 'template1')",
+        )?;
+        for database in managed {
+            psql_exec(
+                &current,
+                MAINTENANCE_DB,
+                &format!("DROP DATABASE {} WITH (FORCE)", quote_identifier(&database)),
+            )?;
+        }
+        psql_exec(
+            &current,
+            MAINTENANCE_DB,
+            &format!("CREATE DATABASE {}", quote_identifier(TEMPLATE_DB)),
+        )?;
+        project.write_env_file(&current.url())?;
+        return Ok(Started {
+            state: current,
+            already_running: false,
+            freshly_initialized: true,
+        });
+    }
+
     stop_locked(project, state, false).await?;
     start_locked(
         project,
@@ -289,6 +345,52 @@ pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Resu
         json,
     )
     .await
+}
+
+/// Run one SQL statement through the instance's own `psql`, against a chosen
+/// database. Errors carry psql's stderr.
+pub fn psql_exec(state: &InstanceState, database: &str, sql: &str) -> Result<()> {
+    psql_capture(state, database, sql).map(|_| ())
+}
+
+/// Rows of a single-column query, one per line.
+pub fn psql_rows(state: &InstanceState, database: &str, sql: &str) -> Result<Vec<String>> {
+    Ok(psql_capture(state, database, sql)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Quote a PostgreSQL identifier for SQL assembled by popgres itself.
+pub fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn psql_capture(state: &InstanceState, database: &str, sql: &str) -> Result<String> {
+    let psql = psql_binary(state)?;
+    let output = std::process::Command::new(&psql)
+        .arg(state.url_for(database))
+        .args([
+            "--quiet",
+            "--no-psqlrc",
+            "-t",
+            "-A",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
+        .output()
+        .with_context(|| format!("failed to run {}", psql.display()))?;
+    if !output.status.success() {
+        bail!(
+            "psql failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn start_locked(
@@ -415,8 +517,10 @@ async fn start_locked(
         ensure_resume_version_matches(&data_dir, previous, pg.as_deref())?;
         // The kept catalog was built against a specific extension set; a
         // config change under it needs a rebuild, said plainly.
-        crate::extensions::check_resume_extensions(
+        crate::extensions::check_resume(
+            &previous.extensions,
             &previous.installation_dir,
+            &previous.pg_version,
             &crate::extensions::specs(&project.config)?,
         )?;
     }
@@ -468,15 +572,25 @@ async fn start_locked(
             |name| name.to_string_lossy().into_owned(),
         );
 
-    // Extensions never touch the pristine base install: a fresh start with
-    // extensions configured runs from a variant — a shared, immutable clone
-    // of the base with the extensions installed. (A resume already points at
-    // its variant through the saved installation_dir.)
     let extension_specs = crate::extensions::specs(&project.config)?;
-    if !resuming && !extension_specs.is_empty() {
+    // Contrib extensions ship inside the install itself — verify they exist
+    // for this version now, while the error can still explain the options.
+    if !resuming {
+        crate::extensions::ensure_contrib_available(
+            &postgresql.settings().installation_dir,
+            &extension_specs,
+        )?;
+    }
+
+    // Packaged extensions never touch the pristine base install: a fresh
+    // start with any configured runs from a variant — a shared, immutable
+    // clone of the base with the extensions installed. Contrib-only configs
+    // skip all of this and run straight off the base. (A resume already
+    // points at its variant through the saved installation_dir.)
+    let packaged_specs = crate::extensions::packaged(&extension_specs);
+    if !resuming && !packaged_specs.is_empty() {
         let variant =
-            crate::extensions::ensure_variant(postgresql.settings(), &extension_specs, json)
-                .await?;
+            crate::extensions::ensure_variant(postgresql.settings(), &packaged_specs, json).await?;
         let mut settings = postgresql.settings().clone();
         settings.installation_dir = variant;
         // Without this the crate re-resolves the (possibly inexact) version
@@ -513,15 +627,20 @@ async fn start_locked(
         return Err(start_error).context("failed to start Postgres");
     }
 
-    if !postgresql
-        .database_exists(&database)
-        .await
-        .context("failed to check database")?
+    // A fresh instance gets the template database only; the caller seeds it,
+    // locks it, and clones `database` from it — so `database` is born
+    // identical to every future test database. A resumed instance already
+    // has both.
+    if !resuming
+        && !postgresql
+            .database_exists(TEMPLATE_DB)
+            .await
+            .context("failed to check the template database")?
     {
         postgresql
-            .create_database(&database)
+            .create_database(TEMPLATE_DB)
             .await
-            .context("failed to create database")?;
+            .context("failed to create the template database")?;
     }
 
     let settings = postgresql.settings();
@@ -544,6 +663,7 @@ async fn start_locked(
         pg_version: resolved_pg_version,
         postmaster_pid: Some(postmaster_pid),
         expires_at,
+        extensions: crate::extensions::names(&extension_specs),
         keep,
     };
     state.save(state_dir)?;
@@ -593,7 +713,7 @@ async fn stop_locked(project: &Project, state: &InstanceState, keep: bool) -> Re
 /// What a `gc` sweep did to one state directory.
 pub enum Reaped {
     /// The instance passed its deadline and was disposed of.
-    Expired { state: InstanceState },
+    Expired { state: Box<InstanceState> },
     /// Still within its TTL, or has none at all.
     Kept,
     /// Another popgres process holds the lock; try again next sweep.
@@ -661,7 +781,11 @@ async fn reap_state_dir(state_dir: &Path, dry_run: bool) -> Option<Reaped> {
     }
     match probe(&state) {
         Liveness::Unverifiable(reason) => return Some(Reaped::Skipped { reason }),
-        Liveness::Running if dry_run => return Some(Reaped::Expired { state }),
+        Liveness::Running if dry_run => {
+            return Some(Reaped::Expired {
+                state: Box::new(state),
+            })
+        }
         Liveness::Running => {
             if let Err(error) = PostgreSQL::new(settings_for(state_dir, &state))
                 .stop()
@@ -672,7 +796,11 @@ async fn reap_state_dir(state_dir: &Path, dry_run: bool) -> Option<Reaped> {
                 });
             }
         }
-        Liveness::NotRunning if dry_run => return Some(Reaped::Expired { state }),
+        Liveness::NotRunning if dry_run => {
+            return Some(Reaped::Expired {
+                state: Box::new(state),
+            })
+        }
         Liveness::NotRunning => {}
     }
     // An expired instance is disposed of, but `keep` still decides whether
@@ -699,7 +827,9 @@ async fn reap_state_dir(state_dir: &Path, dry_run: bool) -> Option<Reaped> {
     if let Ok(project) = Project::at(Path::new(&state.project_dir)) {
         project.clear_env_file().ok();
     }
-    Some(Reaped::Expired { state })
+    Some(Reaped::Expired {
+        state: Box::new(state),
+    })
 }
 
 fn read_postmaster_pid(data_dir: &Path) -> Result<u32> {
@@ -838,6 +968,7 @@ mod tests {
             pg_version: "18.4.0".to_string(),
             postmaster_pid: Some(12345),
             expires_at: None,
+            extensions: Vec::new(),
             keep: false,
         }
     }

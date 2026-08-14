@@ -163,6 +163,10 @@ pub struct InstanceState {
     /// instance. `None` means it lives until someone stops it.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Extension names configured when this instance was created, sorted.
+    /// A resume compares these against the config to catch drift.
+    #[serde(default)]
+    pub extensions: Vec<String>,
     /// Persist data across stops (set by `up --keep` or config).
     pub keep: bool,
 }
@@ -180,6 +184,13 @@ impl InstanceState {
             "postgresql://{}@{}:{}/{}",
             credentials, self.host, self.port, self.database
         )
+    }
+
+    /// The connection string for a specific database on this instance.
+    pub fn url_for(&self, database: &str) -> String {
+        let mut other = self.clone();
+        other.database = database.to_string();
+        other.url()
     }
 
     /// Whether this instance's TTL has run out.
@@ -326,6 +337,7 @@ mod tests {
             pg_version: "18.4.0".to_string(),
             postmaster_pid: Some(12345),
             expires_at: None,
+            extensions: Vec::new(),
             keep: false,
         }
     }

@@ -67,6 +67,15 @@ If separate commands must share an instance:
 Never wipe an instance that was already running. Never use `down --wipe` or
 `reset` unless disposing of the data is explicitly intended.
 
+## Isolate parallel test workers
+
+When tests run in parallel workers, give each worker its own database instead
+of sharing one: run `popgres testdb --json` per worker in a global setup hook
+and hand its `url` to that worker as `DATABASE_URL`. Each clone starts as an
+exact copy of the seeded database in about 0.1 s. Drop the generated clones
+with `popgres testdb --clean` when the run ends. Do not create a clone per
+individual test — use transactions or truncation within a worker.
+
 ## Guarantee cleanup with a deadline
 
 Pass `--ttl` whenever starting an instance that outlives a single command, so
@@ -100,6 +109,8 @@ Prefer JSON for automation:
 - `cache --json`: `postgres`, `variants`, `instances` (each entry with
   `name`, `size_bytes`, `referenced`), `total_bytes`, `removed`. Only run
   `cache --clean` when the user asks to reclaim disk space.
+- `testdb --json`: `url`, `database`, `template`; `testdb --clean --json`:
+  `dropped`.
 - `list --json`: `instances` (each with `project_dir`, `status`, `running`,
   `port`, `pg_version`, `database`, `keep`, `expires_at`, `expired`,
   `current`), `count`. Read-only, and never includes connection URLs.
@@ -139,11 +150,15 @@ it. Deleting `.popgres/` disposes of the instance data. Set
 `location = "global"` for projects inside synced folders (Dropbox, iCloud,
 OneDrive) — syncing a live database directory risks corruption.
 
-For vector search, add `extensions = ["vector"]` with `pg_version = "16"`
-(pgvector currently ships prebuilt for PostgreSQL 16 only). The extension is
-installed and created before the seed hook runs, so seeds and migrations can
-use `vector` columns immediately. Changing the extensions of a kept database
-requires `popgres reset`.
+Declare extensions with `extensions = [...]`. The ~46 bundled contrib
+extensions (`pg_trgm`, `hstore`, `pgcrypto`, `citext`, `uuid-ossp`,
+`pg_stat_statements`, …) work on any PostgreSQL version at no cost. For
+vector search, add `extensions = ["vector"]` with `pg_version = "16"`
+(pgvector currently ships prebuilt for PostgreSQL 16 only). Extensions are
+created before the seed hook runs, so seeds and migrations can use them
+immediately, and `testdb` clones inherit them. PostGIS, TimescaleDB and
+pg_cron are not available — no portable prebuilt binaries exist. Changing
+the extensions of a kept database requires `popgres reset`.
 
 Use `port = 0` for collision-free allocation. Omit `password` for the default
 passwordless loopback-only instance. A `seed` SQL file or shell command runs

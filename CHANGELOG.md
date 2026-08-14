@@ -19,9 +19,21 @@ is below 1.0, minor releases may change behavior.
 
 ### Added
 
-- **PostgreSQL extensions.** `extensions = ["vector"]` in `popgres.toml`
-  installs pgvector (or `vectors` for pgvecto.rs) and creates it before the
-  seed hook runs. The pristine PostgreSQL install is never modified: projects
+- **Test databases from a template.** A fresh instance now seeds a template
+  database (`popgres_template`), locks it against connections, and clones the
+  working database from it. `popgres testdb` clones it again in ~0.1 s — one
+  private, fully seeded database per parallel test worker — and
+  `testdb --clean` drops every generated clone. Seeds now run against the
+  template (`DATABASE_URL` points there during seeding), so extensions and
+  seed data are inherited by every clone. `popgres reset` on a running
+  instance uses the same machinery: same port, seed re-run, well under a
+  second instead of a full re-initialization.
+- **PostgreSQL extensions.** `extensions = [...]` in `popgres.toml` creates
+  extensions before the seed hook runs. The ~46 bundled contrib extensions
+  (`pg_trgm`, `hstore`, `pgcrypto`, `citext`, `uuid-ossp`,
+  `pg_stat_statements`, …) work on every PostgreSQL version with no download
+  and no extra disk. Downloaded extensions — `vector` (pgvector) and
+  `vectors` (pgvecto.rs) — install into shared variants. The pristine PostgreSQL install is never modified: projects
   with extensions run from an immutable, globally shared *variant* built once
   per version-and-extension combination — the first build takes seconds,
   every later project reuses it instantly, and `popgres gc` evicts variants

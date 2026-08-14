@@ -36,17 +36,189 @@ fn instance_payload(state: &InstanceState, already_running: bool) -> serde_json:
     })
 }
 
-/// Ready a freshly initialized database: create the configured extensions,
-/// then run the seed hook — in that order, so seeds can use the extensions.
+/// Ready a freshly initialized instance.
+///
+/// The template database is built first — extensions created, seed run
+/// against it — then locked against connections, and the working database is
+/// cloned from it. Cloning from a locked template cannot fail on stray
+/// connections, and every later `popgres testdb` clone is born from exactly
+/// what the working database started as.
 fn seed_if_fresh(project: &Project, started: &Started, json: bool) -> Result<()> {
-    if started.freshly_initialized {
-        let specs = crate::extensions::specs(&project.config)?;
-        if !specs.is_empty() {
-            crate::extensions::create_in_database(&started.state, &specs)?;
+    if !started.freshly_initialized {
+        return Ok(());
+    }
+    let template = InstanceState {
+        database: instance::TEMPLATE_DB.to_string(),
+        ..started.state.clone()
+    };
+    let prepared = prepare_template(project, &template, json);
+
+    // Whatever the preparation did, the working database must exist
+    // afterwards — the URL popgres prints has to point at something, and a
+    // partially seeded database beats a missing one.
+    let finalized: Result<()> = (|| {
+        instance::psql_exec(
+            &started.state,
+            instance::MAINTENANCE_DB,
+            &format!(
+                "ALTER DATABASE {} WITH ALLOW_CONNECTIONS false",
+                instance::quote_identifier(instance::TEMPLATE_DB)
+            ),
+        )?;
+        instance::psql_exec(
+            &started.state,
+            instance::MAINTENANCE_DB,
+            &format!(
+                "CREATE DATABASE {} TEMPLATE {}",
+                instance::quote_identifier(&started.state.database),
+                instance::quote_identifier(instance::TEMPLATE_DB)
+            ),
+        )?;
+        Ok(())
+    })();
+
+    match (prepared, finalized) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(prepare_error), Ok(())) => Err(prepare_error),
+        (Ok(()), Err(finalize_error)) => {
+            Err(finalize_error.context("failed to create the working database from the template"))
         }
-        if let Some(recipe) = project.config.seed.as_deref() {
-            seed::run(project, &started.state, recipe, json)?;
+        (Err(prepare_error), Err(finalize_error)) => Err(prepare_error.context(format!(
+            "also failed to create the working database: {finalize_error:#}"
+        ))),
+    }
+}
+
+fn prepare_template(project: &Project, template: &InstanceState, json: bool) -> Result<()> {
+    let specs = crate::extensions::specs(&project.config)?;
+    if !specs.is_empty() {
+        crate::extensions::create_in_database(template, &specs)?;
+    }
+    if let Some(recipe) = project.config.seed.as_deref() {
+        seed::run(project, template, recipe, json)?;
+    }
+    Ok(())
+}
+
+/// Create (or clean up) disposable test databases cloned from the template.
+///
+/// The intended shape: one clone per parallel test worker, created in a
+/// global setup hook, all disposed of together by `--clean` or the
+/// instance's own teardown.
+pub fn testdb(name: Option<String>, clean: bool, json: bool) -> Result<()> {
+    let project = Project::discover()?;
+    let state = project.running_instance()?;
+    let has_template = !instance::psql_rows(
+        &state,
+        instance::MAINTENANCE_DB,
+        &format!(
+            "SELECT 1 FROM pg_database WHERE datname = '{}'",
+            instance::TEMPLATE_DB
+        ),
+    )?
+    .is_empty();
+    if !has_template {
+        anyhow::bail!(
+            "this instance has no template database (it was created before templates existed) — \
+             run `popgres reset` to rebuild with one"
+        );
+    }
+
+    if clean {
+        let pattern = generated_clone_pattern(&state.database);
+        let clones = instance::psql_rows(
+            &state,
+            instance::MAINTENANCE_DB,
+            &format!("SELECT datname FROM pg_database WHERE datname LIKE '{pattern}' ESCAPE '\\'"),
+        )?;
+        for clone in &clones {
+            instance::psql_exec(
+                &state,
+                instance::MAINTENANCE_DB,
+                &format!(
+                    "DROP DATABASE {} WITH (FORCE)",
+                    instance::quote_identifier(clone)
+                ),
+            )?;
         }
+        if json {
+            println!("{}", serde_json::json!({ "dropped": clones }));
+        } else {
+            println!("dropped {} test database(s)", clones.len());
+        }
+        return Ok(());
+    }
+
+    let database = match name {
+        Some(name) => {
+            validate_database_name(&name)?;
+            name
+        }
+        None => generated_clone_name(&state.database),
+    };
+    instance::psql_exec(
+        &state,
+        instance::MAINTENANCE_DB,
+        &format!(
+            "CREATE DATABASE {} TEMPLATE {}",
+            instance::quote_identifier(&database),
+            instance::quote_identifier(instance::TEMPLATE_DB)
+        ),
+    )?;
+
+    let url = state.url_for(&database);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "url": url,
+                "database": database,
+                "template": instance::TEMPLATE_DB,
+            })
+        );
+    } else {
+        eprintln!("popgres: test database {database} ready");
+        println!("{url}");
+    }
+    Ok(())
+}
+
+/// `<database>_t_<random>` — recognizable, so `--clean` can find every
+/// generated clone without bookkeeping. Named clones are the caller's own.
+fn generated_clone_name(database: &str) -> String {
+    let base: String = database.chars().take(50).collect();
+    format!("{base}_t_{:08x}", rand::random::<u32>())
+}
+
+/// The SQL LIKE pattern matching generated clone names, quotes and
+/// wildcards escaped.
+fn generated_clone_pattern(database: &str) -> String {
+    let base: String = database.chars().take(50).collect();
+    let escaped = base
+        .replace('\'', "''")
+        .replace('\\', "\\\\")
+        .replace('_', "\\_")
+        .replace('%', "\\%");
+    format!("{escaped}\\_t\\_%")
+}
+
+/// A conservative subset of valid PostgreSQL identifiers, so a `--name` can
+/// be embedded in quoted SQL without surprises.
+fn validate_database_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid {
+        anyhow::bail!(
+            "invalid database name `{name}` — use letters, digits and underscores, \
+             starting with a letter, at most 63 characters"
+        );
     }
     Ok(())
 }
@@ -678,6 +850,37 @@ mod tests {
     #[cfg(unix)]
     use super::child_exit_code;
     use super::ttl_label;
+    use super::{generated_clone_name, generated_clone_pattern, validate_database_name};
+
+    #[test]
+    fn generated_clone_names_carry_the_database_and_a_random_suffix() {
+        let name = generated_clone_name("db");
+        assert!(name.starts_with("db_t_"), "{name}");
+        assert_eq!(name.len(), "db_t_".len() + 8);
+        assert!(validate_database_name(&name).is_ok());
+        // A long database name still yields a legal identifier (≤ 63 chars).
+        let name = generated_clone_name(&"x".repeat(60));
+        assert!(name.len() <= 63);
+        assert!(validate_database_name(&name).is_ok());
+    }
+
+    #[test]
+    fn the_clean_pattern_matches_generated_names_only() {
+        // LIKE-escaped underscores: `db_t_` must match literally, so a
+        // database named `dbxty` can never be swept up.
+        assert_eq!(generated_clone_pattern("db"), "db\\_t\\_%");
+        assert_eq!(generated_clone_pattern("my_app"), "my\\_app\\_t\\_%");
+    }
+
+    #[test]
+    fn database_names_are_validated_conservatively() {
+        validate_database_name("worker_1").unwrap();
+        validate_database_name("_x").unwrap();
+        for bad in ["", "1abc", "has-dash", "has space", "quote\"d", "sneak'y"] {
+            assert!(validate_database_name(bad).is_err(), "{bad} should fail");
+        }
+        assert!(validate_database_name(&"x".repeat(64)).is_err());
+    }
 
     // A fixed "now" keeps these deterministic: reading the clock twice —
     // once here and once inside the formatter — makes every boundary flaky.
