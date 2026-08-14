@@ -24,6 +24,9 @@ pub struct Config {
     pub keep: Option<bool>,
     /// SQL file or shell command to run once, after a fresh initdb.
     pub seed: Option<String>,
+    /// How long an instance may live before `popgres gc` disposes of it,
+    /// e.g. "30m". Left out, it lives until someone stops it.
+    pub ttl: Option<String>,
     /// File to write DATABASE_URL into when an instance starts.
     pub env_file: Option<PathBuf>,
 }
@@ -41,11 +44,43 @@ impl Config {
     }
 }
 
+/// Parse a TTL like `90s`, `30m`, `2h`, `1d`. A bare number means seconds.
+pub fn parse_ttl(raw: &str) -> Result<std::time::Duration> {
+    let raw = raw.trim();
+    let (digits, unit_seconds) = match raw.chars().last() {
+        Some('s') => (&raw[..raw.len() - 1], 1),
+        Some('m') => (&raw[..raw.len() - 1], 60),
+        Some('h') => (&raw[..raw.len() - 1], 60 * 60),
+        Some('d') => (&raw[..raw.len() - 1], 24 * 60 * 60),
+        _ => (raw, 1),
+    };
+    let amount: u64 = digits.trim().parse().map_err(|_| {
+        anyhow::anyhow!("invalid ttl `{raw}` — use a number with s, m, h or d, e.g. `30m`")
+    })?;
+    if amount == 0 {
+        anyhow::bail!("invalid ttl `{raw}` — a ttl must be longer than zero");
+    }
+    let seconds = amount.checked_mul(unit_seconds).ok_or_else(|| {
+        anyhow::anyhow!("invalid ttl `{raw}` — the requested duration is too large")
+    })?;
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
 /// Find the project this directory belongs to: the nearest ancestor holding a
 /// `popgres.toml`, else the nearest git root, else the directory itself.
 ///
 /// Keying off the project root rather than the current directory means `popgres
 /// up` in the repo root and `popgres url` in a subdirectory find the same instance.
+/// The config of a known project root, without walking ancestors.
+pub fn at(root: &Path) -> Result<Config> {
+    let config_file = root.join(CONFIG_FILE);
+    if config_file.is_file() {
+        Config::load(&config_file)
+    } else {
+        Ok(Config::default())
+    }
+}
+
 pub fn discover(start: &Path) -> Result<(PathBuf, Config)> {
     for dir in start.ancestors() {
         let config_file = dir.join(CONFIG_FILE);
@@ -72,6 +107,7 @@ mod tests {
             password = "hunter2"
             port = 5544
             keep = true
+            ttl = "30m"
             seed = "./db/seed.sql"
             env_file = ".env.local"
             "#,
@@ -83,6 +119,7 @@ mod tests {
         assert_eq!(config.password.as_deref(), Some("hunter2"));
         assert_eq!(config.fixed_port(), Some(5544));
         assert_eq!(config.keep, Some(true));
+        assert_eq!(config.ttl.as_deref(), Some("30m"));
         assert_eq!(config.seed.as_deref(), Some("./db/seed.sql"));
         assert_eq!(config.env_file, Some(PathBuf::from(".env.local")));
     }
@@ -94,6 +131,34 @@ mod tests {
         assert_eq!(config.fixed_port(), None);
         // No password configured is what gives an instance no password at all.
         assert!(config.password.is_none());
+    }
+
+    #[test]
+    fn ttl_units_all_parse() {
+        assert_eq!(parse_ttl("90s").unwrap().as_secs(), 90);
+        assert_eq!(parse_ttl("30m").unwrap().as_secs(), 1800);
+        assert_eq!(parse_ttl("2h").unwrap().as_secs(), 7200);
+        assert_eq!(parse_ttl("1d").unwrap().as_secs(), 86400);
+        // A bare number is seconds, and surrounding space is forgiven.
+        assert_eq!(parse_ttl(" 45 ").unwrap().as_secs(), 45);
+    }
+
+    #[test]
+    fn a_nonsense_ttl_is_rejected_with_guidance() {
+        for bad in ["", "soon", "30x", "-5m", "0", "0h", "18446744073709551615d"] {
+            let error = parse_ttl(bad).unwrap_err().to_string();
+            assert!(error.contains("ttl"), "{bad} produced: {error}");
+        }
+    }
+
+    #[test]
+    fn ttl_can_come_from_the_config_file() {
+        let config: Config = toml::from_str(r#"ttl = "30m""#).unwrap();
+        assert_eq!(config.ttl.as_deref(), Some("30m"));
+        assert_eq!(
+            parse_ttl(config.ttl.as_deref().unwrap()).unwrap().as_secs(),
+            1800
+        );
     }
 
     #[test]

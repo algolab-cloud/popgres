@@ -18,9 +18,9 @@ For what the commands do and how to configure a project, see the
 directory. Its state lives under the platform data dir keyed by a hash of that
 path — `~/.local/share/popgres/<hash>/` on Linux,
 `~/Library/Application Support/popgres/<hash>/` on macOS — holding the data
-directory, `state.json` (host, port, credentials, database, version, keep), and
-the password file. Postgres binaries are cached once globally and shared by all
-projects.
+directory, `state.json` (host, port, credentials, database, version, keep, and
+an optional expiry deadline), and the password file. Postgres binaries are
+cached once globally and shared by all projects.
 
 **Port and credentials.** Bound to `127.0.0.1` on a random free port, so
 projects never clash. By default popgres writes its own `pg_hba.conf` trusting
@@ -31,12 +31,12 @@ place instead.
 **Lifecycle.** `popgres run` starts the instance, injects `DATABASE_URL` and the
 `PG*` variables into the child, and tears everything down when the child exits —
 signals included. It exits with the child's exit code. An instance that was
-already running is reused and left running. `down` handles the crash case: if
-the recorded port is dead, it just cleans up the leftovers.
+already running is reused and left running. Lifecycle transitions take an
+advisory per-project lock, and liveness checks verify the recorded postmaster
+identity before adopting, stopping, or wiping an instance.
 
-The crate's `PostgreSQL` value stops the server when it drops, which is wrong
-for every command except `run`, so `start_instance` deliberately leaks its
-handle.
+The crate's `PostgreSQL` value stops the server when it drops, so the start path
+deliberately forgets its handle and the command layer owns every teardown.
 
 **Fresh-start seeding.** Because the default is a pristine database every run,
 the `seed` hook — a `.sql` file or a shell command — runs after a fresh
@@ -50,6 +50,12 @@ the `seed` hook — a `.sql` file or a shell command — runs after a fresh
    teardown; `psql`; `reset`.
 3. **Project config + seeding.** `popgres.toml`, seed hook, `env_file` writing,
    `--pg <version>` selection.
+4. **Safe automation.** Verified postmaster liveness, serialized lifecycle
+   transitions, private credential state, failure-safe cleanup, JSON output on
+   every command, stable exit codes, and child signal exit propagation.
+5. **Expiry and global cleanup.** Optional `--ttl`/`ttl` deadlines persisted in
+   state, plus a lock-safe `popgres gc` sweep that disposes only expired
+   instances and honors kept data.
 
 ## Next
 
@@ -57,14 +63,9 @@ the `seed` hook — a `.sql` file or a shell command — runs after a fresh
 real Postgres, use it, and dispose of it without a human, a TTY, or leftover
 processes when it forgets to clean up.
 
-- `--json` on every command, including `url` and `run`; errors as JSON on
-  stderr; deterministic exit codes (0 ok, 2 already-running, 3 port busy, …).
 - Named ad-hoc instances (`up --name test-run-42`) for scratch databases
   unrelated to any project directory, and `popgres list` to see them all.
   Random ports make running many at once free.
-- `--ttl 30m`: the instance disposes of itself even if the agent crashes or
-  forgets. A supervisor process spawned by `up`, plus `popgres gc` to reap
-  anything past its deadline or with a dead parent.
 - `popgres sql "select 1"` for one-off queries against a running instance.
 - `popgres mcp` (stdio) exposing the same core as MCP tools, so agents needn't
   shell out at all.

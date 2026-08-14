@@ -192,10 +192,11 @@ pub async fn start(
     keep: bool,
     port: Option<u16>,
     pg: Option<String>,
+    ttl: Option<String>,
     json: bool,
 ) -> Result<Started> {
     let _lock = StateLock::acquire(&project.state_dir, json)?;
-    start_locked(project, keep, port, pg, json).await
+    start_locked(project, keep, port, pg, ttl, json).await
 }
 
 /// Stop the instance and, unless we're keeping it, wipe everything it left behind.
@@ -214,6 +215,7 @@ pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Resu
         state.keep,
         Some(state.port),
         Some(state.pg_version.clone()),
+        None,
         json,
     )
     .await
@@ -224,22 +226,62 @@ async fn start_locked(
     keep: bool,
     port: Option<u16>,
     pg: Option<String>,
+    ttl: Option<String>,
     json: bool,
 ) -> Result<Started> {
     let state_dir = project.state_dir.as_path();
     let keep = keep || project.config.keep.unwrap_or(false);
     let port = port.or_else(|| project.config.fixed_port());
     let pg = pg.or_else(|| project.config.pg_version.clone());
+    let ttl = ttl.or_else(|| project.config.ttl.clone());
+    let expires_at = ttl
+        .as_deref()
+        .map(|raw| {
+            let ttl = crate::config::parse_ttl(raw)?;
+            crate::state::now_unix()
+                .checked_add(ttl.as_secs())
+                .with_context(|| format!("invalid ttl `{raw}` — the deadline is too far away"))
+        })
+        .transpose()?;
 
-    let previous = InstanceState::load(state_dir)?;
+    let mut previous = InstanceState::load(state_dir)?;
 
-    // Already running? Be idempotent.
-    if let Some(existing) = previous.as_ref() {
+    // Already running? Be idempotent — unless its TTL ran out, in which case
+    // this project's own expired instance is disposed of and started afresh
+    // rather than silently handed back.
+    if let Some(existing) = previous.clone().as_ref() {
         match probe(existing) {
+            Liveness::Running if existing.is_expired() => {
+                emit_event(
+                    json,
+                    serde_json::json!({ "event": "expired", "port": existing.port }),
+                    &format!(
+                        "popgres: the instance on port {} passed its ttl — replacing it",
+                        existing.port
+                    ),
+                );
+                stop_locked(project, existing, existing.keep).await?;
+                if !existing.keep {
+                    // The data is gone, so nothing about it should carry over.
+                    previous = None;
+                }
+            }
             Liveness::Running => {
-                project.write_env_file(&existing.url())?;
+                // A new ttl on an `up` for a running instance re-arms it;
+                // without one the existing deadline stands.
+                let state = if expires_at.is_some() && expires_at != existing.expires_at {
+                    let renewed = InstanceState {
+                        expires_at,
+                        ..existing.clone()
+                    };
+                    renewed.save(state_dir)?;
+                    renewed
+                } else {
+                    existing.clone()
+                };
+                project.write_env_file(&state.url())?;
                 return Ok(Started {
-                    state: existing.clone(),
+                    state,
                     already_running: true,
                     freshly_initialized: false,
                 });
@@ -391,6 +433,7 @@ async fn start_locked(
             |name| name.to_string_lossy().into_owned(),
         ),
         postmaster_pid: Some(postmaster_pid),
+        expires_at,
         keep,
     };
     state.save(state_dir)?;
@@ -435,6 +478,100 @@ async fn stop_locked(project: &Project, state: &InstanceState, keep: bool) -> Re
     }
     // The URL is dead either way: a kept instance comes back on a new port.
     project.clear_env_file()
+}
+
+/// What a `gc` sweep did to one state directory.
+pub enum Reaped {
+    /// The instance passed its deadline and was disposed of.
+    Expired { state: InstanceState },
+    /// Still within its TTL, or has none at all.
+    Kept,
+    /// Another popgres process holds the lock; try again next sweep.
+    Busy,
+    /// Found, but not safe to touch — reported, never acted on.
+    Skipped { reason: String },
+}
+
+/// Dispose of every instance past its deadline, across all projects.
+///
+/// Each project is taken under its own lock and skipped if busy, so a sweep can
+/// never interrupt a start in progress. An instance whose liveness cannot be
+/// confirmed is reported rather than wiped, exactly as `stop` treats it.
+pub async fn gc() -> Result<Vec<(PathBuf, Reaped)>> {
+    let mut swept = Vec::new();
+    for state_dir in crate::state::all_state_dirs()? {
+        if let Some(outcome) = reap_state_dir(&state_dir).await {
+            swept.push((state_dir, outcome));
+        }
+    }
+    Ok(swept)
+}
+
+/// Sweep one state directory without allowing its failures to abort the
+/// machine-wide pass. Global cleanup should still make progress when one old
+/// project has corrupt state, missing permissions, or a broken installation.
+async fn reap_state_dir(state_dir: &Path) -> Option<Reaped> {
+    let _lock = match StateLock::try_acquire(state_dir) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Some(Reaped::Busy),
+        Err(error) => {
+            return Some(Reaped::Skipped {
+                reason: format!("cannot lock state: {error:#}"),
+            })
+        }
+    };
+    // Re-read under the lock: the owner may have just stopped it.
+    let state = match InstanceState::load(state_dir) {
+        Ok(Some(state)) => state,
+        Ok(None) => return None,
+        Err(error) => {
+            return Some(Reaped::Skipped {
+                reason: format!("cannot load state: {error:#}"),
+            })
+        }
+    };
+    if !state.is_expired() {
+        return Some(Reaped::Kept);
+    }
+    match probe(&state) {
+        Liveness::Unverifiable(reason) => return Some(Reaped::Skipped { reason }),
+        Liveness::Running => {
+            if let Err(error) = PostgreSQL::new(settings_for(state_dir, &state))
+                .stop()
+                .await
+            {
+                return Some(Reaped::Skipped {
+                    reason: format!("failed to stop Postgres: {error:#}"),
+                });
+            }
+        }
+        Liveness::NotRunning => {}
+    }
+    // An expired instance is disposed of, but `keep` still decides whether
+    // its data survives — the TTL bounds the server, not the user's data.
+    let dispose_result = if state.keep {
+        // The deadline has been honored; clearing it stops every later sweep
+        // from reporting this same stopped instance as reaped again.
+        InstanceState {
+            expires_at: None,
+            ..state.clone()
+        }
+        .save(state_dir)
+        .context("failed to preserve expired instance state")
+    } else {
+        wipe_state_dir(state_dir).with_context(|| format!("failed to wipe {}", state_dir.display()))
+    };
+    if let Err(error) = dispose_result {
+        return Some(Reaped::Skipped {
+            reason: format!("{error:#}"),
+        });
+    }
+    // Clearing the env file needs the project's own config; if that project
+    // is gone from disk there is nothing to clear.
+    if let Ok(project) = Project::at(Path::new(&state.project_dir)) {
+        project.clear_env_file().ok();
+    }
+    Some(Reaped::Expired { state })
 }
 
 fn read_postmaster_pid(data_dir: &Path) -> Result<u32> {
@@ -572,6 +709,7 @@ mod tests {
             database: "db".to_string(),
             pg_version: "18.4.0".to_string(),
             postmaster_pid: Some(12345),
+            expires_at: None,
             keep: false,
         }
     }
@@ -732,5 +870,44 @@ mod tests {
         assert!(hba.contains("host    all   all   127.0.0.1/32    trust"));
         // Nothing outside loopback should be mentioned at all.
         assert!(!hba.contains("0.0.0.0"));
+    }
+
+    #[tokio::test]
+    async fn gc_preserves_data_for_an_expired_keep_instance() {
+        let project = tempfile::tempdir().unwrap();
+        let state_dir = project.path().join("state");
+        let data_dir = state_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("marker"), "keep me").unwrap();
+        let state = InstanceState {
+            project_dir: project.path().display().to_string(),
+            data_dir: data_dir.display().to_string(),
+            expires_at: Some(crate::state::now_unix() - 1),
+            keep: true,
+            ..sample()
+        };
+        state.save(&state_dir).unwrap();
+
+        assert!(matches!(
+            reap_state_dir(&state_dir).await,
+            Some(Reaped::Expired { .. })
+        ));
+        assert!(data_dir.join("marker").exists());
+        assert_eq!(
+            InstanceState::load(&state_dir).unwrap().unwrap().expires_at,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_does_not_abort_a_gc_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("state.json"), "{ not json").unwrap();
+
+        let Some(Reaped::Skipped { reason }) = reap_state_dir(dir.path()).await else {
+            panic!("corrupt state should be skipped");
+        };
+        assert!(reason.contains("cannot load state"));
+        assert!(reason.contains("corrupt state file"));
     }
 }

@@ -57,8 +57,8 @@ steps, then run that script through `popgres run`.
 If separate commands must share an instance:
 
 1. Check `popgres status --json`, accepting exit code 12 as "not running".
-2. Start with `popgres up --json` and retain its output without printing it;
-   accept exit code 10 when `already_running` is true.
+2. Start with `popgres up --ttl 30m --json` and retain its output without
+   printing it; accept exit code 10 when `already_running` is true.
 3. Read `url` for child-process environments and `already_running` for cleanup.
 4. Run every dependent command with `DATABASE_URL` set.
 5. If `already_running` is `false`, call `popgres down --json` in a guaranteed
@@ -67,15 +67,33 @@ If separate commands must share an instance:
 Never wipe an instance that was already running. Never use `down --wipe` or
 `reset` unless disposing of the data is explicitly intended.
 
+## Guarantee cleanup with a deadline
+
+Pass `--ttl` whenever starting an instance that outlives a single command, so
+a crash or an interrupted session cannot leave a database running forever:
+
+```sh
+popgres up --ttl 30m --json
+```
+
+Use a deadline comfortably longer than the work. `popgres gc --json` then
+disposes of anything past its deadline, in any project, and never touches an
+instance that has not expired. Prefer `popgres run`, which needs no deadline
+because it disposes of what it started. `--ttl` never replaces an explicit
+`down`; it only bounds the damage when cleanup never happens.
+
 ## Use machine-readable output
 
 Prefer JSON for automation:
 
-- `up --json`: `url`, `host`, `port`, `database`, `already_running`
-- `status --json`: `running`, `url`, `port`, `pg_version`, `keep`
+- `up --json`: `url`, `host`, `port`, `database`, `expires_at`,
+  `already_running`
+- `status --json`: `running`, `url`, `port`, `pg_version`, `keep`,
+  `expires_at`, `expired`
 - `down --json`: `stopped`, `wiped`
 - `reset --json`: `reset`, `url`, `port`, `database`
 - `url --json`: `url`
+- `gc --json`: `reaped` (one object per disposed instance), `examined`
 - `run --json`: newline-delimited lifecycle events on stderr; child stdout is
   unchanged
 
