@@ -21,19 +21,7 @@ pub struct StateLock {
 
 impl StateLock {
     pub fn acquire(state_dir: &Path, json: bool) -> Result<Self> {
-        std::fs::create_dir_all(state_dir)
-            .with_context(|| format!("cannot create {}", state_dir.display()))?;
-        let path = state_dir.join(LOCK_FILE);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .with_context(|| format!("cannot open state lock {}", path.display()))?;
+        let (file, _path) = Self::open(state_dir)?;
         // A blocked lock can mean minutes (another popgres downloading binaries
         // or running a seed) — say so instead of hanging silently.
         match file.try_lock() {
@@ -56,6 +44,46 @@ impl StateLock {
         }
         Ok(Self { _file: file })
     }
+
+    /// The lock if it is free right now, `None` if someone else holds it.
+    ///
+    /// `gc` walks projects it does not own, so it must never block on one that
+    /// is mid-start: a busy project is simply skipped and reaped next sweep.
+    pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
+        let (file, path) = Self::open(state_dir)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("cannot lock {}", path.display()))
+            }
+        }
+    }
+
+    fn open(state_dir: &Path) -> Result<(File, PathBuf)> {
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("cannot create {}", state_dir.display()))?;
+        let path = state_dir.join(LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("cannot open state lock {}", path.display()))?;
+        Ok((file, path))
+    }
+}
+
+/// Seconds since the Unix epoch — how deadlines are recorded, so they survive
+/// process exit, reboots, and clock-independent monotonic sources.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Everything we need to find, reconnect to, and tear down an instance.
@@ -73,6 +101,10 @@ pub struct InstanceState {
     /// Postmaster PID captured at startup. Missing in state written by v0.1.0.
     #[serde(default)]
     pub postmaster_pid: Option<u32>,
+    /// Unix-epoch second after which `popgres gc` may dispose of this
+    /// instance. `None` means it lives until someone stops it.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
     /// Persist data across stops (set by `up --keep` or config).
     pub keep: bool,
 }
@@ -90,6 +122,12 @@ impl InstanceState {
             "postgresql://{}@{}:{}/{}",
             credentials, self.host, self.port, self.database
         )
+    }
+
+    /// Whether this instance's TTL has run out.
+    pub fn is_expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|deadline| now_unix() >= deadline)
     }
 
     pub fn save(&self, state_dir: &Path) -> Result<()> {
@@ -165,12 +203,42 @@ fn private_open_options() -> OpenOptions {
 
 /// Stable per-project state directory: ~/.local/share/popgres/<hash>/ (platform equivalent).
 pub fn project_state_dir(project_dir: &Path) -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("dev", "popgres", "popgres")
-        .context("cannot determine a data directory on this platform")?;
     let mut hasher = Sha256::new();
     hasher.update(project_dir.to_string_lossy().as_bytes());
     let hash = hex(&hasher.finalize()[..6]);
-    Ok(dirs.data_dir().join(hash))
+    Ok(popgres_data_dir()?.join(hash))
+}
+
+/// Where every project's state directory lives.
+pub fn popgres_data_dir() -> Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from("dev", "popgres", "popgres")
+        .context("cannot determine a data directory on this platform")?;
+    Ok(dirs.data_dir().to_path_buf())
+}
+
+/// Every state directory popgres knows about, across all projects.
+pub fn all_state_dirs() -> Result<Vec<PathBuf>> {
+    let root = popgres_data_dir()?;
+    state_dirs_in(&root)
+}
+
+fn state_dirs_in(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut dirs = Vec::new();
+    for entry in
+        std::fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("cannot read {}", root.display()))?;
+        // A state dir is one holding a state.json; anything else here (the
+        // shared binary cache, stray files) is none of gc's business.
+        if entry.path().join("state.json").is_file() {
+            dirs.push(entry.path());
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -193,6 +261,7 @@ mod tests {
             database: "db".to_string(),
             pg_version: "18.4.0".to_string(),
             postmaster_pid: Some(12345),
+            expires_at: None,
             keep: false,
         }
     }
@@ -284,6 +353,81 @@ mod tests {
         assert!(!dir.path().join("data").exists());
         assert!(!dir.path().join("state.json").exists());
         drop(lock);
+    }
+
+    #[test]
+    fn an_instance_without_a_ttl_never_expires() {
+        assert!(!sample().is_expired());
+    }
+
+    #[test]
+    fn a_deadline_in_the_past_is_expired_and_one_ahead_is_not() {
+        let past = InstanceState {
+            expires_at: Some(now_unix() - 1),
+            ..sample()
+        };
+        let future = InstanceState {
+            expires_at: Some(now_unix() + 3600),
+            ..sample()
+        };
+        assert!(past.is_expired());
+        assert!(!future.is_expired());
+    }
+
+    #[test]
+    fn a_deadline_survives_the_state_file_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = InstanceState {
+            expires_at: Some(1_800_000_000),
+            ..sample()
+        };
+        state.save(dir.path()).unwrap();
+        let loaded = InstanceState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.expires_at, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn state_written_before_ttl_existed_still_loads() {
+        // v0.1.0 state has neither postmaster_pid nor expires_at.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("state.json"),
+            r#"{"project_dir":"/p","data_dir":"/p/data","installation_dir":"/i",
+                "host":"127.0.0.1","port":5432,"username":"postgres","password":"",
+                "database":"db","pg_version":"18.4.0","keep":false}"#,
+        )
+        .unwrap();
+
+        let loaded = InstanceState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.expires_at, None);
+        assert!(!loaded.is_expired());
+    }
+
+    #[test]
+    fn a_held_lock_is_reported_busy_rather_than_blocking() {
+        // What keeps `gc` from stalling on a project mid-start.
+        let dir = tempfile::tempdir().unwrap();
+        let held = StateLock::acquire(dir.path(), false).unwrap();
+        let path = dir.path().to_path_buf();
+
+        let busy = std::thread::spawn(move || StateLock::try_acquire(&path).unwrap().is_none())
+            .join()
+            .unwrap();
+
+        assert!(busy);
+        drop(held);
+    }
+
+    #[test]
+    fn only_directories_holding_state_are_swept() {
+        // all_state_dirs must ignore the shared binary cache and stray files.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("with-state")).unwrap();
+        std::fs::write(dir.path().join("with-state/state.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.path().join("no-state")).unwrap();
+
+        let found = state_dirs_in(dir.path()).unwrap();
+        assert_eq!(found, [dir.path().join("with-state")]);
     }
 
     #[test]

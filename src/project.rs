@@ -33,6 +33,17 @@ impl Project {
         })
     }
 
+    /// The project rooted at a known directory, for acting on an instance
+    /// recorded by another working directory (as `gc` does).
+    pub fn at(root: &Path) -> Result<Self> {
+        let config = config::at(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            state_dir: project_state_dir(root)?,
+            config,
+        })
+    }
+
     pub fn state(&self) -> Result<Option<InstanceState>> {
         InstanceState::load(&self.state_dir)
     }

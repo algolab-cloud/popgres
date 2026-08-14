@@ -45,6 +45,9 @@ enum Command {
         /// Postgres version requirement, e.g. "=18.4.0" or "18" (default: latest stable)
         #[arg(long)]
         pg: Option<String>,
+        /// Dispose of this instance after a deadline, e.g. "30m" (reaped by `popgres gc`)
+        #[arg(long)]
+        ttl: Option<String>,
     },
     /// Run a command with DATABASE_URL set, then dispose of the database
     ///
@@ -60,6 +63,9 @@ enum Command {
         /// Postgres version requirement, e.g. "=18.4.0" or "18" (default: latest stable)
         #[arg(long)]
         pg: Option<String>,
+        /// Deadline for the instance if the command leaves it running, e.g. "30m"
+        #[arg(long)]
+        ttl: Option<String>,
         /// The command to run, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -85,6 +91,8 @@ enum Command {
     Reset,
     /// Show whether this project's instance is running
     Status,
+    /// Dispose of instances past their --ttl, in every project on this machine
+    Gc,
 }
 
 #[tokio::main]
@@ -113,8 +121,13 @@ async fn main() {
 
 async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
     match command {
-        Command::Up { keep, port, pg } => {
-            let already_running = commands::up(keep, port, pg, json).await?;
+        Command::Up {
+            keep,
+            port,
+            pg,
+            ttl,
+        } => {
+            let already_running = commands::up(keep, port, pg, ttl, json).await?;
             if already_running {
                 std::process::exit(error::ALREADY_RUNNING);
             }
@@ -124,8 +137,9 @@ async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
             keep,
             port,
             pg,
+            ttl,
             cmd,
-        } => commands::run(keep, port, pg, json, cmd).await,
+        } => commands::run(keep, port, pg, ttl, json, cmd).await,
         Command::Down { keep, wipe } => commands::down(keep, wipe, json).await,
         Command::Url => commands::url(json),
         Command::Psql { args } => commands::psql(args),
@@ -136,6 +150,7 @@ async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Gc => commands::gc(json).await,
     }
 }
 
@@ -167,9 +182,13 @@ mod tests {
     #[test]
     fn run_flags_before_the_separator_belong_to_popgres() {
         let Command::Run {
-            cmd, keep, port, ..
+            cmd,
+            keep,
+            port,
+            ttl,
+            ..
         } = parse(&[
-            "popgres", "run", "--keep", "--port", "5555", "--", "vite", "dev",
+            "popgres", "run", "--keep", "--port", "5555", "--ttl", "30m", "--", "vite", "dev",
         ])
         .command
         else {
@@ -177,6 +196,7 @@ mod tests {
         };
         assert!(keep);
         assert_eq!(port, Some(5555));
+        assert_eq!(ttl.as_deref(), Some("30m"));
         assert_eq!(cmd, ["vite", "dev"]);
     }
 
@@ -217,6 +237,11 @@ mod tests {
     #[test]
     fn down_cannot_both_keep_and_wipe() {
         assert!(Cli::try_parse_from(["popgres", "down", "--keep", "--wipe"]).is_err());
+    }
+
+    #[test]
+    fn gc_is_a_global_cleanup_command() {
+        assert!(matches!(parse(&["popgres", "gc"]).command, Command::Gc));
     }
 
     #[test]

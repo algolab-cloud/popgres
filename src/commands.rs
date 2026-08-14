@@ -31,6 +31,7 @@ fn instance_payload(state: &InstanceState, already_running: bool) -> serde_json:
         "host": state.host,
         "port": state.port,
         "database": state.database,
+        "expires_at": state.expires_at,
         "already_running": already_running,
     })
 }
@@ -51,9 +52,15 @@ fn with_cleanup_failure(primary: anyhow::Error, cleanup_error: anyhow::Error) ->
     ))
 }
 
-pub async fn up(keep: bool, port: Option<u16>, pg: Option<String>, json: bool) -> Result<bool> {
+pub async fn up(
+    keep: bool,
+    port: Option<u16>,
+    pg: Option<String>,
+    ttl: Option<String>,
+    json: bool,
+) -> Result<bool> {
     let project = Project::discover()?;
-    let started = instance::start(&project, keep, port, pg, json).await?;
+    let started = instance::start(&project, keep, port, pg, ttl, json).await?;
     // A failed seed leaves the instance up on purpose: the error says so, and
     // the user can inspect or fix and re-seed. `run` is the disposal command.
     seed_if_fresh(&project, &started, json)?;
@@ -78,11 +85,12 @@ pub async fn run(
     keep: bool,
     port: Option<u16>,
     pg: Option<String>,
+    ttl: Option<String>,
     json: bool,
     cmd: Vec<String>,
 ) -> Result<()> {
     let project = Project::discover()?;
-    let started = instance::start(&project, keep, port, pg, json).await?;
+    let started = instance::start(&project, keep, port, pg, ttl, json).await?;
     let already_running = started.already_running;
 
     // `run` promises disposal, so anything that fails between here and the
@@ -314,6 +322,64 @@ pub async fn reset(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Dispose of every instance past its TTL, in this project and any other.
+///
+/// This is the only command that touches instances outside the current
+/// project, and it never destroys anything that has not expired.
+pub async fn gc(json: bool) -> Result<()> {
+    let swept = instance::gc().await?;
+    let mut reaped = Vec::new();
+    for (state_dir, outcome) in &swept {
+        match outcome {
+            instance::Reaped::Expired { state } => {
+                reaped.push(state.clone());
+                emit_event(
+                    json,
+                    serde_json::json!({
+                        "event": "reaped",
+                        "project_dir": state.project_dir,
+                        "port": state.port,
+                        "kept": state.keep,
+                    }),
+                    &format!(
+                        "popgres: reaped the expired instance for {} (port {})",
+                        state.project_dir, state.port
+                    ),
+                );
+            }
+            instance::Reaped::Skipped { reason } => emit_event(
+                json,
+                serde_json::json!({
+                    "event": "skipped",
+                    "state_dir": state_dir.display().to_string(),
+                    "reason": reason,
+                }),
+                &format!("popgres: skipped {} — {reason}", state_dir.display()),
+            ),
+            instance::Reaped::Busy | instance::Reaped::Kept => {}
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "reaped": reaped.iter().map(|state| serde_json::json!({
+                    "project_dir": state.project_dir,
+                    "port": state.port,
+                    "kept": state.keep,
+                })).collect::<Vec<_>>(),
+                "examined": swept.len(),
+            })
+        );
+    } else if reaped.is_empty() {
+        println!("nothing to reap ({} instance(s) examined)", swept.len());
+    } else {
+        println!("reaped {} expired instance(s)", reaped.len());
+    }
+    Ok(())
+}
+
 pub fn status(json: bool) -> Result<bool> {
     let project = Project::discover()?;
     let state = project.state()?;
@@ -328,14 +394,21 @@ pub fn status(json: bool) -> Result<bool> {
                 "port": state.as_ref().map(|s| s.port),
                 "pg_version": state.as_ref().map(|s| s.pg_version.clone()),
                 "keep": state.as_ref().map(|s| s.keep),
+                "expires_at": state.as_ref().and_then(|s| s.expires_at),
+                "expired": state.as_ref().is_some_and(InstanceState::is_expired),
             })
         );
     } else if let Some(s) = state {
         if running {
             println!(
-                "running — Postgres {} on port {}",
+                "running — Postgres {} on port {}{}",
                 s.pg_version.trim_start_matches('='),
-                s.port
+                s.port,
+                if s.is_expired() {
+                    " (past its ttl — `popgres gc` will reap it)"
+                } else {
+                    ""
+                }
             );
         } else {
             println!(

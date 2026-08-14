@@ -48,6 +48,7 @@ Windows x64. Standalone archives are available on
 | `popgres reset` | Wipe and recreate the database |
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
+| `popgres gc` | Dispose of instances past their `--ttl` |
 
 Every command accepts `--json`. `run --json` keeps the child command's stdout
 untouched and writes newline-delimited lifecycle events to stderr. `psql
@@ -68,6 +69,26 @@ Coded exits start at 10 so they can never be confused with a usage error,
 which exits `2`. `run` returns the child command's exit code instead,
 including `128 + signal` when the child is terminated by a signal.
 
+## Expiring instances
+
+An instance started with a deadline becomes eligible for disposal even if
+whoever started it never comes back:
+
+```sh
+popgres up --ttl 30m
+popgres gc            # stops everything past its deadline, in every project
+```
+
+Deadlines are opt-in: without `--ttl` (or `ttl` in `popgres.toml`) an instance
+lives until it is stopped. `up` replaces this project's own expired instance
+rather than handing it back, and `gc` is the only command that touches other
+projects — it never destroys anything that has not expired. An expired
+instance configured with `keep = true` has its server stopped but its data
+preserved.
+
+Run `popgres gc` periodically from a cron job, a CI cleanup step, or an agent's
+teardown to guarantee expired instances are not left behind.
+
 ## Configuration
 
 Popgres works without configuration. Add `popgres.toml` at the project root
@@ -78,6 +99,7 @@ pg_version = "18"        # default: latest stable
 database = "db"          # default: db
 port = 0                 # choose a free port
 keep = false             # wipe data when stopped
+ttl = "30m"              # dispose of the instance after this long
 seed = "./db/seed.sql"   # run after fresh initialization
 env_file = ".env.local"  # write DATABASE_URL while running
 ```
