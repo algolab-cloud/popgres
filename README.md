@@ -61,6 +61,7 @@ Windows x64. Standalone archives are available on
 | `popgres reset` | Wipe and recreate the database |
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
+| `popgres list` | List every instance on this machine |
 | `popgres gc` | Dispose of instances past their `--ttl` |
 
 Every command accepts `--json`. `run --json` keeps the child command's stdout
@@ -89,9 +90,15 @@ whoever started it never comes back:
 
 ```sh
 popgres up --ttl 30m
+popgres list          # every instance on this machine, and what is expiring
 popgres gc --dry-run  # report what has expired, touching nothing
 popgres gc            # stops everything past its deadline, in every project
 ```
+
+`popgres list` is read-only — it starts, stops, and creates nothing — and shows
+each instance's status, port, version, remaining TTL, and project, marking the
+current project with `*`. Connection URLs are deliberately omitted because it
+spans every project; use `popgres url` for this one.
 
 Deadlines are opt-in: without `--ttl` (or `ttl` in `popgres.toml`) an instance
 lives until it is stopped. `up` replaces this project's own expired instance

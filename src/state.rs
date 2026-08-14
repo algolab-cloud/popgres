@@ -63,12 +63,27 @@ impl StateLock {
         Self::try_lock(file, path)
     }
 
+    /// How long a caller that must not block still waits out a lock that is
+    /// only just being released. A lock the kernel has not finished dropping
+    /// can report as held for a few milliseconds after its holder is gone, and
+    /// treating that as "busy" makes `gc` skip a project for no reason.
+    const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+    const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
     fn try_lock(file: File, path: PathBuf) -> Result<Option<Self>> {
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(error)) => {
-                Err(error).with_context(|| format!("cannot lock {}", path.display()))
+        let deadline = std::time::Instant::now() + Self::RELEASE_GRACE;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                // Genuinely held work (a start, a seed) lasts far longer than
+                // the grace period, so this still returns promptly for it.
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Self::RELEASE_POLL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| format!("cannot lock {}", path.display()));
+                }
             }
         }
     }
@@ -416,6 +431,30 @@ mod tests {
         let loaded = InstanceState::load(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.expires_at, None);
         assert!(!loaded.is_expired());
+    }
+
+    #[test]
+    fn a_just_released_lock_is_not_mistaken_for_a_busy_one() {
+        // Releasing a flock is not always visible to the next attempt
+        // immediately, and treating that instant as "busy" makes `gc` skip a
+        // project that nothing is using. Hammer the handoff to prove it holds.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let dir = tempfile::tempdir().unwrap();
+                    for _ in 0..100 {
+                        drop(StateLock::acquire(dir.path(), false).unwrap());
+                        assert!(
+                            StateLock::try_acquire(dir.path()).unwrap().is_some(),
+                            "a released lock was reported busy"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     #[test]

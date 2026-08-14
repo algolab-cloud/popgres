@@ -1,6 +1,6 @@
 {
   "name": "@popgres/cli",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Disposable Postgres for every project — pops up when you start, pops away when you stop. No install, no Docker.",
   "keywords": [
     "postgres",
@@ -23,11 +23,11 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@popgres/darwin-arm64": "0.2.1",
-    "@popgres/darwin-x64": "0.2.1",
-    "@popgres/linux-arm64": "0.2.1",
-    "@popgres/linux-x64": "0.2.1",
-    "@popgres/win32-x64": "0.2.1"
+    "@popgres/darwin-arm64": "0.3.0",
+    "@popgres/darwin-x64": "0.3.0",
+    "@popgres/linux-arm64": "0.3.0",
+    "@popgres/linux-x64": "0.3.0",
+    "@popgres/win32-x64": "0.3.0"
   },
   "engines": {
     "node": ">=18"

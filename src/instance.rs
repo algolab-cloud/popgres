@@ -101,6 +101,56 @@ pub fn instance_is_running(state: &InstanceState) -> bool {
     matches!(probe(state), Liveness::Running)
 }
 
+impl Liveness {
+    /// One stable word for reports and JSON consumers.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::NotRunning => "stopped",
+            Self::Unverifiable(_) => "unknown",
+        }
+    }
+}
+
+/// One entry in a survey of everything popgres knows about on this machine.
+pub enum Entry {
+    Instance {
+        state_dir: PathBuf,
+        state: Box<InstanceState>,
+        liveness: Liveness,
+    },
+    /// State that exists but cannot be read — reported, never hidden, so a
+    /// corrupt directory is visible rather than silently absent.
+    Unreadable { state_dir: PathBuf, reason: String },
+}
+
+/// Every instance popgres knows about, across all projects.
+///
+/// Strictly read-only: it takes no lock and creates nothing, so surveying the
+/// machine can never disturb a project mid-start or leave files behind.
+pub fn list() -> Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    for state_dir in crate::state::all_state_dirs()? {
+        match InstanceState::load(&state_dir) {
+            Ok(Some(state)) => {
+                let liveness = probe(&state);
+                entries.push(Entry::Instance {
+                    state_dir,
+                    state: Box::new(state),
+                    liveness,
+                });
+            }
+            // Vanished between listing and reading; nothing to report.
+            Ok(None) => {}
+            Err(error) => entries.push(Entry::Unreadable {
+                state_dir,
+                reason: format!("{error:#}"),
+            }),
+        }
+    }
+    Ok(entries)
+}
+
 fn postmaster_identity_matches(state: &InstanceState, pid_file: &str) -> bool {
     let lines: Vec<_> = pid_file.lines().collect();
     let Some(pid) = lines.first().and_then(|line| line.parse::<u32>().ok()) else {
@@ -920,7 +970,10 @@ mod tests {
             keep: false,
             ..sample()
         };
-        drop(StateLock::acquire(&state_dir, false).unwrap());
+        // A dry run locks only an existing lock file, so create one directly:
+        // acquiring a real lock here would tie the test to lock lifetimes.
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join(".lock"), "").unwrap();
         state.save(&state_dir).unwrap();
 
         assert!(matches!(
@@ -945,17 +998,30 @@ mod tests {
             expires_at: Some(crate::state::now_unix() + 3600),
             ..sample()
         };
-        drop(StateLock::acquire(&state_dir, false).unwrap());
+        // A dry run locks only an existing lock file, so create one directly:
+        // acquiring a real lock here would tie the test to lock lifetimes.
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join(".lock"), "").unwrap();
         state.save(&state_dir).unwrap();
 
-        assert!(matches!(
-            reap_state_dir(&state_dir, true).await,
-            Some(Reaped::Kept)
-        ));
-        assert!(matches!(
-            reap_state_dir(&state_dir, false).await,
-            Some(Reaped::Kept)
-        ));
+        let dry = reap_state_dir(&state_dir, true).await;
+        assert!(matches!(dry, Some(Reaped::Kept)), "dry: {}", outcome(&dry));
+        let real = reap_state_dir(&state_dir, false).await;
+        assert!(
+            matches!(real, Some(Reaped::Kept)),
+            "real: {}",
+            outcome(&real)
+        );
+    }
+
+    fn outcome(reaped: &Option<Reaped>) -> String {
+        match reaped {
+            Some(Reaped::Kept) => "kept".to_string(),
+            Some(Reaped::Busy) => "busy".to_string(),
+            Some(Reaped::Expired { .. }) => "expired".to_string(),
+            Some(Reaped::Skipped { reason }) => format!("skipped: {reason}"),
+            None => "none".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -1003,6 +1069,40 @@ mod tests {
             Some(Reaped::Skipped { .. })
         ));
         assert!(data_dir.join("postmaster.pid").exists());
+    }
+
+    #[test]
+    fn surveying_an_instance_creates_nothing() {
+        // `list` must never disturb a project: no lock file, no directories,
+        // nothing that a later `gc` or `up` could trip over.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let state = InstanceState {
+            data_dir: state_dir.join("data").display().to_string(),
+            ..sample()
+        };
+        state.save(&state_dir).unwrap();
+        let before: Vec<_> = std::fs::read_dir(&state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+
+        let loaded = InstanceState::load(&state_dir).unwrap().unwrap();
+        let _ = probe(&loaded);
+
+        let after: Vec<_> = std::fs::read_dir(&state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        assert!(!state_dir.join(".lock").exists());
+    }
+
+    #[test]
+    fn liveness_labels_are_stable_words() {
+        assert_eq!(Liveness::Running.label(), "running");
+        assert_eq!(Liveness::NotRunning.label(), "stopped");
+        assert_eq!(Liveness::Unverifiable(String::new()).label(), "unknown");
     }
 
     #[tokio::test]

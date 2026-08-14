@@ -97,6 +97,9 @@ Prefer JSON for automation:
 - `url --json`: `url`
 - `gc --json`: `reaped` (one object per disposed instance), `examined`,
   `dry_run`
+- `list --json`: `instances` (each with `project_dir`, `status`, `running`,
+  `port`, `pg_version`, `database`, `keep`, `expires_at`, `expired`,
+  `current`), `count`. Read-only, and never includes connection URLs.
 - `run --json`: newline-delimited lifecycle events on stderr; child stdout is
   unchanged
 

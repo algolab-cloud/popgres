@@ -4,6 +4,23 @@ All notable changes to popgres are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the version
 is below 1.0, minor releases may change behavior.
 
+## 0.3.0
+
+### Added
+
+- `popgres list` shows every instance on this machine — status, port, version,
+  remaining TTL, and project — marking the current project with `*`. It is
+  strictly read-only: it starts nothing, stops nothing, and creates no files.
+  Connection URLs are omitted because it spans every project; `popgres url`
+  still prints the current one.
+
+### Fixed
+
+- A lock released moments earlier could be reported as still held, making
+  `gc` skip a project that nothing was using. Callers that must not block now
+  wait out a brief release grace period before concluding a project is busy;
+  genuinely held work is still reported promptly.
+
 ## 0.2.1
 
 ### Added

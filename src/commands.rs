@@ -326,6 +326,144 @@ pub async fn reset(json: bool) -> Result<()> {
 ///
 /// This is the only command that touches instances outside the current
 /// project, and it never destroys anything that has not expired.
+/// Survey every instance on this machine — the read-only counterpart to `gc`.
+///
+/// Connection URLs are deliberately omitted: this walks every project, and a
+/// configured password would otherwise be printed for all of them at once.
+/// Use `popgres url` for the current project.
+pub fn list(json: bool) -> Result<()> {
+    let entries = instance::list()?;
+    // Knowing which row is "here" is the common question; a failure to work
+    // that out (deleted cwd) must not sink the survey.
+    let here = Project::discover().ok().map(|project| project.state_dir);
+
+    if json {
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|entry| match entry {
+                instance::Entry::Instance {
+                    state_dir,
+                    state,
+                    liveness,
+                } => serde_json::json!({
+                    "state_dir": state_dir.display().to_string(),
+                    "project_dir": state.project_dir,
+                    "current": here.as_deref() == Some(state_dir.as_path()),
+                    "status": liveness.label(),
+                    "running": matches!(liveness, instance::Liveness::Running),
+                    "port": state.port,
+                    "pg_version": state.pg_version,
+                    "database": state.database,
+                    "keep": state.keep,
+                    "expires_at": state.expires_at,
+                    "expired": state.is_expired(),
+                }),
+                instance::Entry::Unreadable { state_dir, reason } => serde_json::json!({
+                    "state_dir": state_dir.display().to_string(),
+                    "status": "unreadable",
+                    "reason": reason,
+                }),
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "instances": rows, "count": rows.len() })
+        );
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        println!("no instances");
+        return Ok(());
+    }
+
+    let mut rows = Vec::new();
+    for entry in &entries {
+        match entry {
+            instance::Entry::Instance {
+                state_dir,
+                state,
+                liveness,
+            } => rows.push([
+                if here.as_deref() == Some(state_dir.as_path()) {
+                    "*".to_string()
+                } else {
+                    String::new()
+                },
+                liveness.label().to_string(),
+                state.port.to_string(),
+                state.pg_version.trim_start_matches('=').to_string(),
+                ttl_column(state),
+                state.project_dir.clone(),
+            ]),
+            instance::Entry::Unreadable { state_dir, reason } => rows.push([
+                String::new(),
+                "unreadable".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                format!("{} ({reason})", state_dir.display()),
+            ]),
+        }
+    }
+
+    let headers = ["", "STATUS", "PORT", "VERSION", "TTL", "PROJECT"];
+    // The variable-width project path goes last so nothing else can misalign.
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].chars().count())
+                .chain(std::iter::once(headers[column].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let render = |cells: &[String]| {
+        let line: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| {
+                if column + 1 == cells.len() {
+                    cell.clone()
+                } else {
+                    format!("{cell:<width$}", width = widths[column])
+                }
+            })
+            .collect();
+        println!("{}", line.join("  ").trim_end());
+    };
+    render(&headers.map(str::to_string));
+    for row in &rows {
+        render(row);
+    }
+    Ok(())
+}
+
+/// How much life an instance has left, for the human table.
+fn ttl_column(state: &crate::state::InstanceState) -> String {
+    ttl_label(state.expires_at, crate::state::now_unix())
+}
+
+/// Pure so the formatting can be tested without racing the clock.
+fn ttl_label(expires_at: Option<u64>, now: u64) -> String {
+    let Some(deadline) = expires_at else {
+        return "—".to_string();
+    };
+    if now >= deadline {
+        return "expired".to_string();
+    }
+    let remaining = deadline - now;
+    if remaining >= 86_400 {
+        format!("{}d", remaining / 86_400)
+    } else if remaining >= 3_600 {
+        format!("{}h", remaining / 3_600)
+    } else if remaining >= 60 {
+        format!("{}m", remaining / 60)
+    } else {
+        format!("{remaining}s")
+    }
+}
+
 pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
     let swept = instance::gc(dry_run).await?;
     let mut reaped = Vec::new();
@@ -434,6 +572,35 @@ pub fn status(json: bool) -> Result<bool> {
 mod tests {
     #[cfg(unix)]
     use super::child_exit_code;
+    use super::ttl_label;
+
+    // A fixed "now" keeps these deterministic: reading the clock twice —
+    // once here and once inside the formatter — makes every boundary flaky.
+    const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn an_instance_without_a_deadline_shows_a_dash() {
+        assert_eq!(ttl_label(None, NOW), "—");
+    }
+
+    #[test]
+    fn a_deadline_at_or_before_now_reads_as_expired() {
+        assert_eq!(ttl_label(Some(NOW - 1), NOW), "expired");
+        assert_eq!(ttl_label(Some(NOW), NOW), "expired");
+    }
+
+    #[test]
+    fn remaining_time_uses_the_largest_whole_unit() {
+        assert_eq!(ttl_label(Some(NOW + 45), NOW), "45s");
+        assert_eq!(ttl_label(Some(NOW + 90), NOW), "1m");
+        assert_eq!(ttl_label(Some(NOW + 7_200), NOW), "2h");
+        assert_eq!(ttl_label(Some(NOW + 172_800), NOW), "2d");
+        // Boundaries round down to the unit that just became whole.
+        assert_eq!(ttl_label(Some(NOW + 59), NOW), "59s");
+        assert_eq!(ttl_label(Some(NOW + 60), NOW), "1m");
+        assert_eq!(ttl_label(Some(NOW + 3_599), NOW), "59m");
+        assert_eq!(ttl_label(Some(NOW + 86_400), NOW), "1d");
+    }
 
     #[cfg(unix)]
     #[test]
