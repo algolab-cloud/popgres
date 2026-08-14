@@ -91,6 +91,8 @@ enum Command {
     Reset,
     /// Show whether this project's instance is running
     Status,
+    /// List every instance on this machine, in any project
+    List,
     /// Dispose of instances past their --ttl, in every project on this machine
     Gc {
         /// Report what would be disposed of without stopping or wiping anything
@@ -154,6 +156,7 @@ async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::List => commands::list(json),
         Command::Gc { dry_run } => commands::gc(dry_run, json).await,
     }
 }
@@ -241,6 +244,12 @@ mod tests {
     #[test]
     fn down_cannot_both_keep_and_wipe() {
         assert!(Cli::try_parse_from(["popgres", "down", "--keep", "--wipe"]).is_err());
+    }
+
+    #[test]
+    fn list_is_a_global_read_only_command() {
+        assert!(matches!(parse(&["popgres", "list"]).command, Command::List));
+        assert!(parse(&["popgres", "list", "--json"]).json);
     }
 
     #[test]

@@ -36,6 +36,7 @@ npx @popgres/cli up
 | `popgres reset` | Wipe and recreate the database |
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
+| `popgres list` | List every instance on this machine |
 | `popgres gc` | Dispose of instances past their TTL |
 
 For a database shared by several commands, give it an expiry deadline so an
