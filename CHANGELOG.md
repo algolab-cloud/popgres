@@ -4,7 +4,7 @@ All notable changes to popgres are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the version
 is below 1.0, minor releases may change behavior.
 
-## Unreleased
+## 0.4.0
 
 ### Changed
 
@@ -33,12 +33,13 @@ is below 1.0, minor releases may change behavior.
   (`pg_trgm`, `hstore`, `pgcrypto`, `citext`, `uuid-ossp`,
   `pg_stat_statements`, …) work on every PostgreSQL version with no download
   and no extra disk. Downloaded extensions — `vector` (pgvector) and
-  `vectors` (pgvecto.rs) — install into shared variants. The pristine PostgreSQL install is never modified: projects
-  with extensions run from an immutable, globally shared *variant* built once
-  per version-and-extension combination — the first build takes seconds,
-  every later project reuses it instantly, and `popgres gc` evicts variants
-  nothing references. Version pins go in `[extensions_versions]`; changing a
-  kept database's extensions asks for `popgres reset` instead of letting the
+  `vectors` (pgvecto.rs) — install into shared variants. The pristine
+  PostgreSQL install is never modified: projects with downloaded extensions
+  run from an immutable, globally shared *variant* built once per
+  version-and-extension combination. The first build takes seconds, every
+  later project reuses it instantly, and `popgres gc` evicts variants nothing
+  references. Version pins go in `[extensions_versions]`; changing a kept
+  database's extensions asks for `popgres reset` instead of letting the
   postmaster fail. pgvector currently ships prebuilt for PostgreSQL 16, and
   the error says exactly that if another version is requested.
 - A small global registry lets `list` and `gc` find local instances across
