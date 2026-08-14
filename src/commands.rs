@@ -6,30 +6,64 @@ use anyhow::{Context, Result};
 
 use crate::instance::{self, instance_env, instance_is_running, psql_binary, Started};
 use crate::project::Project;
+use crate::seed;
 use crate::state::InstanceState;
 
 /// How long a child gets to wind down on its own after Ctrl-C before we insist.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
+/// One lifecycle message, in whichever shape the invocation asked for.
+/// JSON events and human messages both go to stderr; stdout stays reserved
+/// for results (and for `run`'s child).
+pub(crate) fn emit_event(json: bool, event: serde_json::Value, human: &str) {
+    if json {
+        eprintln!("{event}");
+    } else {
+        eprintln!("{human}");
+    }
+}
+
+/// The one JSON shape describing a started instance, shared by `up` and
+/// `run`'s "ready" event so the two can never drift apart.
+fn instance_payload(state: &InstanceState, already_running: bool) -> serde_json::Value {
+    serde_json::json!({
+        "url": state.url(),
+        "host": state.host,
+        "port": state.port,
+        "database": state.database,
+        "already_running": already_running,
+    })
+}
+
+/// Run the seed hook against a freshly initialized database.
+fn seed_if_fresh(project: &Project, started: &Started, json: bool) -> Result<()> {
+    if started.freshly_initialized {
+        if let Some(recipe) = project.config.seed.as_deref() {
+            seed::run(project, &started.state, recipe, json)?;
+        }
+    }
+    Ok(())
+}
+
+fn with_cleanup_failure(primary: anyhow::Error, cleanup_error: anyhow::Error) -> anyhow::Error {
+    primary.context(format!(
+        "also failed to clean up the database: {cleanup_error:#}"
+    ))
+}
+
 pub async fn up(keep: bool, port: Option<u16>, pg: Option<String>, json: bool) -> Result<bool> {
     let project = Project::discover()?;
     let started = instance::start(&project, keep, port, pg, json).await?;
+    // A failed seed leaves the instance up on purpose: the error says so, and
+    // the user can inspect or fix and re-seed. `run` is the disposal command.
+    seed_if_fresh(&project, &started, json)?;
     emit_up(&started.state, json, started.already_running);
     Ok(started.already_running)
 }
 
 fn emit_up(state: &InstanceState, json: bool, already: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "url": state.url(),
-                "host": state.host,
-                "port": state.port,
-                "database": state.database,
-                "already_running": already,
-            })
-        );
+        println!("{}", instance_payload(state, already));
     } else {
         if already {
             eprintln!("popgres: already running on port {}", state.port);
@@ -48,23 +82,23 @@ pub async fn run(
     cmd: Vec<String>,
 ) -> Result<()> {
     let project = Project::discover()?;
-    let Started {
-        state,
-        already_running,
-    } = instance::start(&project, keep, port, pg, json).await?;
+    let started = instance::start(&project, keep, port, pg, json).await?;
+    let already_running = started.already_running;
+
+    // `run` promises disposal, so anything that fails between here and the
+    // child's exit — seeding included — must still tear the instance down.
+    if let Err(seed_error) = seed_if_fresh(&project, &started, json) {
+        return match cleanup_after_run(&project, already_running, json).await {
+            Ok(()) => Err(seed_error),
+            Err(cleanup_error) => Err(with_cleanup_failure(seed_error, cleanup_error)),
+        };
+    }
+    let state = started.state;
 
     if json {
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "event": "ready",
-                "url": state.url(),
-                "host": state.host,
-                "port": state.port,
-                "database": state.database,
-                "already_running": already_running,
-            })
-        );
+        let mut ready = instance_payload(&state, already_running);
+        ready["event"] = "ready".into();
+        eprintln!("{ready}");
     } else if already_running {
         eprintln!(
             "popgres: reusing the instance on port {} — it will be left running",
@@ -84,11 +118,9 @@ pub async fn run(
         Err(error) => {
             let spawn_error =
                 anyhow::Error::new(error).context(format!("failed to run `{}`", cmd.join(" ")));
-            return match cleanup_after_run(&project, &state, already_running, json).await {
+            return match cleanup_after_run(&project, already_running, json).await {
                 Ok(()) => Err(spawn_error),
-                Err(cleanup_error) => Err(spawn_error.context(format!(
-                    "also failed to clean up the database: {cleanup_error:#}"
-                ))),
+                Err(cleanup_error) => Err(with_cleanup_failure(spawn_error, cleanup_error)),
             };
         }
     };
@@ -101,11 +133,11 @@ pub async fn run(
             match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
                 Ok(result) => result.context("failed to wait for the child process"),
                 Err(_) => {
-                    if json {
-                        eprintln!("{}", serde_json::json!({ "event": "killing_child" }));
-                    } else {
-                        eprintln!("popgres: command did not exit, killing it");
-                    }
+                    emit_event(
+                        json,
+                        serde_json::json!({ "event": "killing_child" }),
+                        "popgres: command did not exit, killing it",
+                    );
                     child.start_kill().ok();
                     child.wait().await.context("failed to wait for the child process")
                 }
@@ -113,9 +145,11 @@ pub async fn run(
         }
     };
 
-    let cleanup = cleanup_after_run(&project, &state, already_running, json).await;
+    let cleanup = cleanup_after_run(&project, already_running, json).await;
     match (status, cleanup) {
-        (Ok(status), Ok(())) => {
+        (Ok(status), cleanup) => {
+            // The child's result is the point of the whole invocation — report
+            // it even when the teardown afterwards failed.
             let exit_code = child_exit_code(&status);
             if json {
                 eprintln!(
@@ -123,50 +157,51 @@ pub async fn run(
                     serde_json::json!({ "event": "exit", "exit_code": exit_code })
                 );
             }
-            std::process::exit(exit_code);
+            match cleanup {
+                Ok(()) => std::process::exit(exit_code),
+                Err(cleanup_error) => Err(cleanup_error.context(format!(
+                    "the command exited with code {exit_code}, but cleaning up the database failed"
+                ))),
+            }
         }
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "also failed to clean up the database: {cleanup_error:#}"
-        ))),
+        (Err(error), Err(cleanup_error)) => Err(with_cleanup_failure(error, cleanup_error)),
     }
 }
 
 /// Teardown runs however the child exited or whether it started at all.
-/// `state.keep` is the resolved answer because keep can also come from config.
-async fn cleanup_after_run(
-    project: &Project,
-    state: &InstanceState,
-    already_running: bool,
-    json: bool,
-) -> Result<()> {
+///
+/// The state is reloaded rather than reusing what `start` returned: the child
+/// may have legitimately replaced the instance (`popgres reset` between test
+/// suites), and `run`'s promise of disposal covers whatever the project's
+/// instance is by the time it exits.
+async fn cleanup_after_run(project: &Project, already_running: bool, json: bool) -> Result<()> {
     if already_running {
-        if json {
-            eprintln!(
-                "{}",
-                serde_json::json!({ "event": "left_running", "already_running": true })
-            );
-        } else {
-            eprintln!("popgres: leaving the instance that was already running");
-        }
-    } else {
-        instance::stop(project, state, state.keep).await?;
-        if json {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "event": "stopped",
-                    "kept": state.keep,
-                    "wiped": !state.keep,
-                })
-            );
-        } else if state.keep {
-            eprintln!("popgres: stopped (data kept)");
-        } else {
-            eprintln!("popgres: stopped and wiped — poof!");
-        }
+        emit_event(
+            json,
+            serde_json::json!({ "event": "left_running", "already_running": true }),
+            "popgres: leaving the instance that was already running",
+        );
+        return Ok(());
     }
+    let Some(current) = project.state()? else {
+        return project.clear_env_file();
+    };
+    // `keep` can have been re-resolved by whatever the child did; honor it.
+    instance::stop(project, &current, current.keep, json).await?;
+    emit_event(
+        json,
+        serde_json::json!({
+            "event": "stopped",
+            "kept": current.keep,
+            "wiped": !current.keep,
+        }),
+        if current.keep {
+            "popgres: stopped (data kept)"
+        } else {
+            "popgres: stopped and wiped — poof!"
+        },
+    );
     Ok(())
 }
 
@@ -211,7 +246,7 @@ pub async fn down(keep_flag: bool, wipe_flag: bool, json: bool) -> Result<()> {
 
     // Without --wipe there is no way out of a `keep = true` config.
     let keep = (keep_flag || state.keep) && !wipe_flag;
-    instance::stop(&project, &state, keep).await?;
+    instance::stop(&project, &state, keep, json).await?;
 
     if json {
         println!("{}", serde_json::json!({ "stopped": true, "wiped": !keep }));
@@ -241,7 +276,7 @@ pub fn psql(args: Vec<String>) -> Result<()> {
         .args(&args)
         .status()
         .with_context(|| format!("failed to run {}", binary.display()))?;
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(child_exit_code(&status));
 }
 
 pub async fn reset(json: bool) -> Result<()> {
@@ -253,17 +288,11 @@ pub async fn reset(json: bool) -> Result<()> {
         ));
     };
 
-    // Reset means fresh, so the data goes even for a --keep instance. Holding on
-    // to the port keeps the URL stable for anything already pointed at it.
-    instance::stop(&project, &state, false).await?;
-    let started = instance::start(
-        &project,
-        state.keep,
-        Some(state.port),
-        Some(state.pg_version.clone()),
-        json,
-    )
-    .await?;
+    // Reset means fresh, so the data goes even for a --keep instance. The
+    // stop and start happen under one lock, keeping the port — and so the
+    // URL — stable for anything already pointed at it.
+    let started = instance::reset(&project, &state, json).await?;
+    seed_if_fresh(&project, &started, json)?;
 
     if json {
         println!(
@@ -288,10 +317,7 @@ pub async fn reset(json: bool) -> Result<()> {
 pub fn status(json: bool) -> Result<bool> {
     let project = Project::discover()?;
     let state = project.state()?;
-    let running = match state.as_ref() {
-        Some(state) => instance_is_running(state)?,
-        None => false,
-    };
+    let running = state.as_ref().is_some_and(instance_is_running);
 
     if json {
         println!(

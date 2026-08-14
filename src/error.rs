@@ -3,9 +3,11 @@
 use std::fmt;
 
 pub const GENERAL: i32 = 1;
-pub const ALREADY_RUNNING: i32 = 2;
-pub const PORT_BUSY: i32 = 3;
-pub const NOT_RUNNING: i32 = 4;
+// Coded exits start at 10: clap exits 2 on a usage error, so low codes would
+// make a mistyped flag indistinguishable from a real lifecycle condition.
+pub const ALREADY_RUNNING: i32 = 10;
+pub const PORT_BUSY: i32 = 11;
+pub const NOT_RUNNING: i32 = 12;
 
 #[derive(Debug)]
 struct CodedError {

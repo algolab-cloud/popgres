@@ -10,8 +10,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use postgresql_embedded::{PostgreSQL, Settings, SettingsBuilder, Version, VersionReq};
 
+use crate::commands::emit_event;
 use crate::project::Project;
-use crate::seed;
 use crate::state::{wipe_state_dir, InstanceState, StateLock};
 use crate::ENV_VAR;
 
@@ -22,38 +22,83 @@ pub struct Started {
     pub state: InstanceState,
     /// We found it already running and adopted it, rather than starting it.
     pub already_running: bool,
+    /// A brand-new initdb — the caller should run the seed hook.
+    pub freshly_initialized: bool,
+}
+
+/// What we could establish about the recorded instance.
+///
+/// `Unverifiable` is the load-bearing variant: when the postmaster identity
+/// matches but liveness cannot be confirmed either way, callers must fail
+/// loudly rather than wipe or re-init a possibly-live data directory.
+pub enum Liveness {
+    Running,
+    NotRunning,
+    Unverifiable(String),
 }
 
 /// Confirm that the recorded data directory owns a live PostgreSQL process on
 /// the recorded port. A bare TCP connection is insufficient because another
 /// service may have claimed the port after a crash.
-pub fn instance_is_running(state: &InstanceState) -> Result<bool> {
+pub fn probe(state: &InstanceState) -> Liveness {
     let data_dir = Path::new(&state.data_dir);
     let pid_file = data_dir.join("postmaster.pid");
     let raw = match std::fs::read_to_string(&pid_file) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Liveness::NotRunning,
         Err(error) => {
-            return Err(error).with_context(|| format!("cannot read {}", pid_file.display()))
+            return Liveness::Unverifiable(format!("cannot read {}: {error}", pid_file.display()))
         }
     };
     if !postmaster_identity_matches(state, &raw) {
-        return Ok(false);
+        return Liveness::NotRunning;
     }
 
+    // From here on the pid file provably belongs to this instance, so an
+    // inconclusive check must not be reported as "not running" — that is what
+    // lets a wipe pull the data directory out from under a live postmaster.
     let pg_ctl = installation_binary(state, "pg_ctl");
     if !pg_ctl.exists() {
-        return Ok(false);
+        return if postgres_handshake(&state.host, state.port) {
+            Liveness::Running
+        } else {
+            Liveness::Unverifiable(format!(
+                "the cached PostgreSQL install at {} is gone, so the recorded instance \
+                 cannot be verified or stopped — if it is not running, delete the data \
+                 directory {} yourself",
+                state.installation_dir, state.data_dir,
+            ))
+        };
     }
     let status = std::process::Command::new(&pg_ctl)
         .args(["status", "-D"])
         .arg(data_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to run {}", pg_ctl.display()))?;
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            if postgres_handshake(&state.host, state.port) {
+                Liveness::Running
+            } else {
+                Liveness::Unverifiable(format!(
+                    "the postmaster (PID file {}) looks alive but did not answer a \
+                     PostgreSQL handshake on port {} — it may still be starting up; \
+                     retry in a moment",
+                    pid_file.display(),
+                    state.port,
+                ))
+            }
+        }
+        Ok(_) => Liveness::NotRunning,
+        Err(error) => {
+            Liveness::Unverifiable(format!("failed to run {}: {error}", pg_ctl.display()))
+        }
+    }
+}
 
-    Ok(status.success() && postgres_handshake(&state.host, state.port))
+pub fn instance_is_running(state: &InstanceState) -> bool {
+    matches!(probe(state), Liveness::Running)
 }
 
 fn postmaster_identity_matches(state: &InstanceState, pid_file: &str) -> bool {
@@ -140,15 +185,47 @@ fn settings_for(state_dir: &Path, state: &InstanceState) -> Settings {
 /// Start (or adopt) this project's instance and persist its state.
 ///
 /// Flags win over `popgres.toml`, which wins over the built-in defaults.
+/// Seeding is the caller's job: run the seed hook when `freshly_initialized`.
 pub async fn start(
     project: &Project,
     keep: bool,
     port: Option<u16>,
     pg: Option<String>,
-    quiet: bool,
+    json: bool,
+) -> Result<Started> {
+    let _lock = StateLock::acquire(&project.state_dir, json)?;
+    start_locked(project, keep, port, pg, json).await
+}
+
+/// Stop the instance and, unless we're keeping it, wipe everything it left behind.
+pub async fn stop(project: &Project, state: &InstanceState, keep: bool, json: bool) -> Result<()> {
+    let _lock = StateLock::acquire(&project.state_dir, json)?;
+    stop_locked(project, state, keep).await
+}
+
+/// Wipe and re-initialize under a single lock, so nothing can grab the port —
+/// which reset deliberately holds on to — between the stop and the start.
+pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Result<Started> {
+    let _lock = StateLock::acquire(&project.state_dir, json)?;
+    stop_locked(project, state, false).await?;
+    start_locked(
+        project,
+        state.keep,
+        Some(state.port),
+        Some(state.pg_version.clone()),
+        json,
+    )
+    .await
+}
+
+async fn start_locked(
+    project: &Project,
+    keep: bool,
+    port: Option<u16>,
+    pg: Option<String>,
+    json: bool,
 ) -> Result<Started> {
     let state_dir = project.state_dir.as_path();
-    let _lock = StateLock::acquire(state_dir)?;
     let keep = keep || project.config.keep.unwrap_or(false);
     let port = port.or_else(|| project.config.fixed_port());
     let pg = pg.or_else(|| project.config.pg_version.clone());
@@ -157,12 +234,19 @@ pub async fn start(
 
     // Already running? Be idempotent.
     if let Some(existing) = previous.as_ref() {
-        if instance_is_running(existing)? {
-            project.write_env_file(&existing.url())?;
-            return Ok(Started {
-                state: existing.clone(),
-                already_running: true,
-            });
+        match probe(existing) {
+            Liveness::Running => {
+                project.write_env_file(&existing.url())?;
+                return Ok(Started {
+                    state: existing.clone(),
+                    already_running: true,
+                    freshly_initialized: false,
+                });
+            }
+            Liveness::NotRunning => {}
+            Liveness::Unverifiable(reason) => {
+                bail!("cannot tell whether this project's instance is still running: {reason}")
+            }
         }
     }
 
@@ -212,9 +296,7 @@ pub async fn start(
             .installation_dir(PathBuf::from(&previous.installation_dir))
             .version(VersionReq::from_str(&previous.pg_version).unwrap_or_default());
 
-        if let Some(requested) = pg.as_deref() {
-            ensure_resume_version_matches(&data_dir, previous, requested)?;
-        }
+        ensure_resume_version_matches(&data_dir, previous, pg.as_deref())?;
     }
 
     // Only a fresh instance can take a configured password: an existing role
@@ -238,9 +320,11 @@ pub async fn start(
     }
 
     let mut postgresql = PostgreSQL::new(builder.build());
-    if !resuming && !quiet {
-        eprintln!(
-            "popgres: initializing a fresh database (the first run of a Postgres version downloads it)..."
+    if !resuming {
+        emit_event(
+            json,
+            serde_json::json!({ "event": "initializing" }),
+            "popgres: initializing a fresh database (the first run of a Postgres version downloads it)...",
         );
     }
     postgresql
@@ -257,13 +341,14 @@ pub async fn start(
     }
 
     if let Err(start_error) = postgresql.start().await {
+        // Our own postmaster may have come up anyway (e.g. the readiness wait
+        // timed out) — stop it rather than orphan it behind the error. Only a
+        // port that is still bound afterwards belongs to someone else.
+        let _ = postgresql.stop().await;
         if port.is_some_and(tcp_port_is_bound) {
             return Err(crate::error::coded(
                 crate::error::PORT_BUSY,
-                format!(
-                    "port {} became busy while Postgres was starting",
-                    port.unwrap()
-                ),
+                format!("port {} is held by another process", port.unwrap()),
             ));
         }
         return Err(start_error).context("failed to start Postgres");
@@ -313,36 +398,35 @@ pub async fn start(
     // the whole point is that it outlives this process until someone stops it.
     std::mem::forget(postgresql);
 
-    // Seeding is what makes wiped-by-default pleasant, so it runs on every
-    // fresh database — but never over data we just resumed.
-    if !resuming {
-        if let Some(recipe) = project.config.seed.as_deref() {
-            seed::run(project, &state, recipe, quiet)?;
-        }
-    }
     project.write_env_file(&state.url())?;
 
     Ok(Started {
         state,
         already_running: false,
+        freshly_initialized: !resuming,
     })
 }
 
-/// Stop the instance and, unless we're keeping it, wipe everything it left behind.
-pub async fn stop(project: &Project, state: &InstanceState, keep: bool) -> Result<()> {
+async fn stop_locked(project: &Project, state: &InstanceState, keep: bool) -> Result<()> {
     let state_dir = project.state_dir.as_path();
-    let _lock = StateLock::acquire(state_dir)?;
     let Some(current) = InstanceState::load(state_dir)? else {
         return project.clear_env_file();
     };
     if current != *state {
         bail!("the popgres instance changed while waiting for the state lock — retry the command");
     }
-    if instance_is_running(&current)? {
-        PostgreSQL::new(settings_for(state_dir, &current))
-            .stop()
-            .await
-            .context("failed to stop Postgres")?;
+    match probe(&current) {
+        Liveness::Running => {
+            PostgreSQL::new(settings_for(state_dir, &current))
+                .stop()
+                .await
+                .context("failed to stop Postgres")?;
+        }
+        Liveness::NotRunning => {}
+        // Never wipe a data directory we cannot prove is dead.
+        Liveness::Unverifiable(reason) => {
+            bail!("cannot tell whether the instance is still running: {reason}")
+        }
     }
     if !keep {
         wipe_state_dir(state_dir)
@@ -363,10 +447,14 @@ fn read_postmaster_pid(data_dir: &Path) -> Result<u32> {
         .with_context(|| format!("invalid postmaster PID in {}", path.display()))
 }
 
+/// A kept data directory must agree with the saved state, and with the
+/// requested version when there is one. The consistency half runs on every
+/// resume — a mismatch otherwise surfaces as Postgres's raw "database files
+/// are incompatible with server" long after the useful moment to say so.
 fn ensure_resume_version_matches(
     data_dir: &Path,
     previous: &InstanceState,
-    requested: &str,
+    requested: Option<&str>,
 ) -> Result<()> {
     let version_file = data_dir.join("PG_VERSION");
     let data_major = std::fs::read_to_string(&version_file)
@@ -386,6 +474,9 @@ fn ensure_resume_version_matches(
             data_major
         );
     }
+    let Some(requested) = requested else {
+        return Ok(());
+    };
     let requirement = VersionReq::from_str(requested)
         .with_context(|| format!("invalid Postgres version requirement: {requested}"))?;
     if !requirement.matches(&actual) {
@@ -508,6 +599,43 @@ mod tests {
     }
 
     #[test]
+    fn a_matching_pid_file_without_binaries_is_unverifiable_not_stopped() {
+        // The wipe-under-a-live-postmaster guard: identity matches, but the
+        // cached install (and so pg_ctl) is gone and nothing answers the port.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let state = InstanceState {
+            data_dir: data_dir.display().to_string(),
+            installation_dir: dir.path().join("no-such-install").display().to_string(),
+            // An unused port so the handshake cannot succeed by accident.
+            port: 1,
+            ..sample()
+        };
+        std::fs::write(
+            data_dir.join("postmaster.pid"),
+            format!(
+                "12345\n{}\n1723456789\n1\n/tmp\n127.0.0.1\n",
+                state.data_dir
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(probe(&state), Liveness::Unverifiable(_)));
+        assert!(!instance_is_running(&state));
+    }
+
+    #[test]
+    fn a_missing_pid_file_reads_as_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = InstanceState {
+            data_dir: dir.path().display().to_string(),
+            ..sample()
+        };
+        assert!(matches!(probe(&state), Liveness::NotRunning));
+    }
+
+    #[test]
     fn postgres_handshake_rejects_an_arbitrary_tcp_service() {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -548,7 +676,7 @@ mod tests {
     fn resuming_rejects_a_different_postgres_major() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PG_VERSION"), "18\n").unwrap();
-        let error = ensure_resume_version_matches(dir.path(), &sample(), "19").unwrap_err();
+        let error = ensure_resume_version_matches(dir.path(), &sample(), Some("19")).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("data dir is PostgreSQL 18.x"));
         assert!(message.contains("--pg 18"));
@@ -558,7 +686,17 @@ mod tests {
     fn resuming_accepts_a_compatible_postgres_requirement() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PG_VERSION"), "18\n").unwrap();
-        ensure_resume_version_matches(dir.path(), &sample(), "18").unwrap();
+        ensure_resume_version_matches(dir.path(), &sample(), Some("18")).unwrap();
+    }
+
+    #[test]
+    fn resuming_checks_state_against_the_data_dir_even_without_a_request() {
+        // A plain `popgres up` must catch state/data disagreement too, not
+        // only invocations that happen to pass --pg.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "17\n").unwrap();
+        let error = ensure_resume_version_matches(dir.path(), &sample(), None).unwrap_err();
+        assert!(error.to_string().contains("popgres reset"));
     }
 
     #[test]

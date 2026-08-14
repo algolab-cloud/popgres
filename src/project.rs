@@ -45,7 +45,7 @@ impl Project {
                 "no popgres instance found for this project — run `popgres up` first",
             ));
         };
-        if !instance_is_running(&state)? {
+        if !instance_is_running(&state) {
             return Err(crate::error::coded(
                 crate::error::NOT_RUNNING,
                 "instance is not running — run `popgres up`",

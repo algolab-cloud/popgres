@@ -60,12 +60,13 @@ Automation can rely on these exit codes:
 | --- | --- |
 | `0` | Command completed successfully |
 | `1` | Popgres failed |
-| `2` | `up` found the instance already running |
-| `3` | A requested port is already in use |
-| `4` | `status` found no running instance |
+| `10` | `up` found the instance already running |
+| `11` | A requested port is already in use |
+| `12` | `status` found no running instance |
 
-`run` otherwise returns the child command's exit code, including `128 +
-signal` when the child is terminated by a signal.
+Coded exits start at 10 so they can never be confused with a usage error,
+which exits `2`. `run` returns the child command's exit code instead,
+including `128 + signal` when the child is terminated by a signal.
 
 ## Configuration
 

@@ -20,7 +20,7 @@ pub struct StateLock {
 }
 
 impl StateLock {
-    pub fn acquire(state_dir: &Path) -> Result<Self> {
+    pub fn acquire(state_dir: &Path, json: bool) -> Result<Self> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("cannot create {}", state_dir.display()))?;
         let path = state_dir.join(LOCK_FILE);
@@ -34,8 +34,26 @@ impl StateLock {
         let file = options
             .open(&path)
             .with_context(|| format!("cannot open state lock {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("cannot lock state directory {}", state_dir.display()))?;
+        // A blocked lock can mean minutes (another popgres downloading binaries
+        // or running a seed) — say so instead of hanging silently.
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                crate::commands::emit_event(
+                    json,
+                    serde_json::json!({ "event": "waiting_for_lock" }),
+                    "popgres: waiting for another popgres process to finish...",
+                );
+                file.lock().with_context(|| {
+                    format!("cannot lock state directory {}", state_dir.display())
+                })?;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| {
+                    format!("cannot lock state directory {}", state_dir.display())
+                });
+            }
+        }
         Ok(Self { _file: file })
     }
 }
@@ -238,11 +256,11 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
-        let first = StateLock::acquire(dir.path()).unwrap();
+        let first = StateLock::acquire(dir.path(), false).unwrap();
         let path = dir.path().to_path_buf();
         let (tx, rx) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let _second = StateLock::acquire(&path).unwrap();
+            let _second = StateLock::acquire(&path, false).unwrap();
             tx.send(()).unwrap();
         });
 
@@ -255,7 +273,7 @@ mod tests {
     #[test]
     fn wiping_state_preserves_only_the_lock_file() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = StateLock::acquire(dir.path()).unwrap();
+        let lock = StateLock::acquire(dir.path(), false).unwrap();
         std::fs::create_dir_all(dir.path().join("data/nested")).unwrap();
         std::fs::write(dir.path().join("data/nested/file"), "data").unwrap();
         std::fs::write(dir.path().join("state.json"), "state").unwrap();

@@ -25,6 +25,9 @@ const ENV_VAR: &str = "DATABASE_URL";
     long_about = None
 )]
 struct Cli {
+    /// Emit machine-readable JSON: results on stdout, lifecycle events and errors on stderr
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -42,9 +45,6 @@ enum Command {
         /// Postgres version requirement, e.g. "=18.4.0" or "18" (default: latest stable)
         #[arg(long)]
         pg: Option<String>,
-        /// Emit machine-readable JSON on stdout
-        #[arg(long)]
-        json: bool,
     },
     /// Run a command with DATABASE_URL set, then dispose of the database
     ///
@@ -60,9 +60,6 @@ enum Command {
         /// Postgres version requirement, e.g. "=18.4.0" or "18" (default: latest stable)
         #[arg(long)]
         pg: Option<String>,
-        /// Emit machine-readable lifecycle events and errors on stderr
-        #[arg(long)]
-        json: bool,
         /// The command to run, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -75,51 +72,35 @@ enum Command {
         /// Wipe the data even if the instance or popgres.toml asked to keep it
         #[arg(long, conflicts_with = "keep")]
         wipe: bool,
-        /// Emit machine-readable JSON on stdout
-        #[arg(long)]
-        json: bool,
     },
     /// Print the connection URL of the running instance
-    Url {
-        /// Emit machine-readable JSON on stdout
-        #[arg(long)]
-        json: bool,
-    },
+    Url,
     /// Open a psql shell into the running instance
     Psql {
-        /// Emit machine-readable errors on stderr
-        #[arg(long)]
-        json: bool,
         /// Extra arguments passed straight through to psql, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Wipe the data and start again from a fresh database, even if it was kept
-    Reset {
-        /// Emit machine-readable JSON on stdout
-        #[arg(long)]
-        json: bool,
-    },
+    Reset,
     /// Show whether this project's instance is running
-    Status {
-        /// Emit machine-readable JSON on stdout
-        #[arg(long)]
-        json: bool,
-    },
+    Status,
 }
 
 #[tokio::main]
 async fn main() {
-    let command = Cli::parse().command;
-    let json = command.json();
-    if let Err(failure) = dispatch(command).await {
+    let cli = Cli::parse();
+    let json = cli.json;
+    if let Err(failure) = dispatch(cli.command, json).await {
         let exit_code = error::exit_code(&failure);
         if json {
             eprintln!(
                 "{}",
                 serde_json::json!({
                     "ok": false,
-                    "error": { "message": failure.to_string() },
+                    // {:#} keeps the whole cause chain — agents get no less
+                    // diagnostic detail than the human-readable path below.
+                    "error": { "message": format!("{failure:#}") },
                     "exit_code": exit_code,
                 })
             );
@@ -130,28 +111,9 @@ async fn main() {
     }
 }
 
-impl Command {
-    fn json(&self) -> bool {
-        match self {
-            Self::Up { json, .. }
-            | Self::Run { json, .. }
-            | Self::Down { json, .. }
-            | Self::Url { json }
-            | Self::Psql { json, .. }
-            | Self::Reset { json }
-            | Self::Status { json } => *json,
-        }
-    }
-}
-
-async fn dispatch(command: Command) -> anyhow::Result<()> {
+async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
     match command {
-        Command::Up {
-            keep,
-            port,
-            pg,
-            json,
-        } => {
+        Command::Up { keep, port, pg } => {
             let already_running = commands::up(keep, port, pg, json).await?;
             if already_running {
                 std::process::exit(error::ALREADY_RUNNING);
@@ -162,14 +124,13 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             keep,
             port,
             pg,
-            json,
             cmd,
         } => commands::run(keep, port, pg, json, cmd).await,
-        Command::Down { keep, wipe, json } => commands::down(keep, wipe, json).await,
-        Command::Url { json } => commands::url(json),
-        Command::Psql { args, .. } => commands::psql(args),
-        Command::Reset { json } => commands::reset(json).await,
-        Command::Status { json } => {
+        Command::Down { keep, wipe } => commands::down(keep, wipe, json).await,
+        Command::Url => commands::url(json),
+        Command::Psql { args } => commands::psql(args),
+        Command::Reset => commands::reset(json).await,
+        Command::Status => {
             if !commands::status(json)? {
                 std::process::exit(error::NOT_RUNNING);
             }
@@ -183,8 +144,8 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    fn parse(args: &[&str]) -> Command {
-        Cli::try_parse_from(args).expect("should parse").command
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("should parse")
     }
 
     #[test]
@@ -194,7 +155,8 @@ mod tests {
 
     #[test]
     fn run_takes_everything_after_the_separator_as_the_command() {
-        let Command::Run { cmd, keep, .. } = parse(&["popgres", "run", "--", "npm", "run", "dev"])
+        let Command::Run { cmd, keep, .. } =
+            parse(&["popgres", "run", "--", "npm", "run", "dev"]).command
         else {
             panic!("expected a run command");
         };
@@ -209,6 +171,7 @@ mod tests {
         } = parse(&[
             "popgres", "run", "--keep", "--port", "5555", "--", "vite", "dev",
         ])
+        .command
         else {
             panic!("expected a run command");
         };
@@ -219,20 +182,14 @@ mod tests {
 
     #[test]
     fn run_passes_the_childs_own_flags_through_untouched() {
-        // The child's `--keep` is the child's business, not ours.
-        let Command::Run { cmd, keep, .. } = parse(&[
-            "popgres",
-            "run",
-            "--",
-            "cargo",
-            "test",
-            "--keep",
-            "--nocapture",
-        ]) else {
+        // The child's `--keep` and `--json` are the child's business, not ours.
+        let cli = parse(&["popgres", "run", "--", "cargo", "test", "--keep", "--json"]);
+        assert!(!cli.json);
+        let Command::Run { cmd, keep, .. } = cli.command else {
             panic!("expected a run command");
         };
         assert!(!keep);
-        assert_eq!(cmd, ["cargo", "test", "--keep", "--nocapture"]);
+        assert_eq!(cmd, ["cargo", "test", "--keep", "--json"]);
     }
 
     #[test]
@@ -242,7 +199,8 @@ mod tests {
 
     #[test]
     fn psql_forwards_extra_arguments() {
-        let Command::Psql { args, .. } = parse(&["popgres", "psql", "--", "-c", "select 1"]) else {
+        let Command::Psql { args } = parse(&["popgres", "psql", "--", "-c", "select 1"]).command
+        else {
             panic!("expected a psql command");
         };
         assert_eq!(args, ["-c", "select 1"]);
@@ -250,7 +208,7 @@ mod tests {
 
     #[test]
     fn psql_needs_no_arguments() {
-        let Command::Psql { args, .. } = parse(&["popgres", "psql"]) else {
+        let Command::Psql { args } = parse(&["popgres", "psql"]).command else {
             panic!("expected a psql command");
         };
         assert!(args.is_empty());
@@ -262,18 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn json_is_available_on_run_url_and_psql() {
-        assert!(matches!(
-            parse(&["popgres", "run", "--json", "--", "true"]),
-            Command::Run { json: true, .. }
-        ));
-        assert!(matches!(
-            parse(&["popgres", "url", "--json"]),
-            Command::Url { json: true }
-        ));
-        assert!(matches!(
-            parse(&["popgres", "psql", "--json"]),
-            Command::Psql { json: true, .. }
-        ));
+    fn json_is_one_global_flag_valid_on_every_subcommand() {
+        assert!(parse(&["popgres", "run", "--json", "--", "true"]).json);
+        assert!(parse(&["popgres", "url", "--json"]).json);
+        assert!(parse(&["popgres", "psql", "--json"]).json);
+        assert!(parse(&["popgres", "status", "--json"]).json);
+        assert!(!parse(&["popgres", "status"]).json);
     }
 }

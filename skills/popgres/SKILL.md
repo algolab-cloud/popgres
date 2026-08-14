@@ -56,9 +56,9 @@ steps, then run that script through `popgres run`.
 
 If separate commands must share an instance:
 
-1. Check `popgres status --json`, accepting exit code 4 as "not running".
+1. Check `popgres status --json`, accepting exit code 12 as "not running".
 2. Start with `popgres up --json` and retain its output without printing it;
-   accept exit code 2 when `already_running` is true.
+   accept exit code 10 when `already_running` is true.
 3. Read `url` for child-process environments and `already_running` for cleanup.
 4. Run every dependent command with `DATABASE_URL` set.
 5. If `already_running` is `false`, call `popgres down --json` in a guaranteed
@@ -80,10 +80,11 @@ Prefer JSON for automation:
   unchanged
 
 `psql --json` makes wrapper errors machine-readable but leaves psql output
-alone. JSON-mode errors are written to stderr. Exit code 2 means `up` adopted
-an existing instance; exit code 3 means a requested port is busy; exit code 4
-means no running instance was found; `run` propagates the child's code,
-including 128 plus its terminating signal.
+alone. JSON-mode errors are written to stderr. Exit code 10 means `up` adopted
+an existing instance; exit code 11 means a requested port is busy; exit code
+12 means no running instance was found; exit code 2 is a usage error from a
+mistyped invocation. `run` propagates the child's code, including 128 plus
+its terminating signal.
 
 Treat `url` and JSON fields containing `url` as secrets because a configured
 password may be embedded. Pass connection values through environment
