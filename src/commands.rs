@@ -351,6 +351,7 @@ pub fn status(json: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::child_exit_code;
 
     #[cfg(unix)]

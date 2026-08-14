@@ -137,7 +137,8 @@ fn postgres_handshake(host: &str, port: u16) -> bool {
         return false;
     };
     for address in addresses {
-        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300))
+        else {
             continue;
         };
         stream
