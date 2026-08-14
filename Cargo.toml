@@ -1,7 +1,10 @@
 [package]
 name = "popgres"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
+# Current postgresql_embedded and SQLx releases require Rust 1.94. Declaring
+# it turns a confusing dependency error on older toolchains into clear guidance.
+rust-version = "1.94"
 description = "Disposable Postgres for every project — pops up when you start, pops away when you stop. No install, no Docker."
 license = "MIT"
 repository = "https://github.com/algolab-cloud/popgres"

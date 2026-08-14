@@ -497,10 +497,10 @@ pub enum Reaped {
 /// Each project is taken under its own lock and skipped if busy, so a sweep can
 /// never interrupt a start in progress. An instance whose liveness cannot be
 /// confirmed is reported rather than wiped, exactly as `stop` treats it.
-pub async fn gc() -> Result<Vec<(PathBuf, Reaped)>> {
+pub async fn gc(dry_run: bool) -> Result<Vec<(PathBuf, Reaped)>> {
     let mut swept = Vec::new();
     for state_dir in crate::state::all_state_dirs()? {
-        if let Some(outcome) = reap_state_dir(&state_dir).await {
+        if let Some(outcome) = reap_state_dir(&state_dir, dry_run).await {
             swept.push((state_dir, outcome));
         }
     }
@@ -510,8 +510,13 @@ pub async fn gc() -> Result<Vec<(PathBuf, Reaped)>> {
 /// Sweep one state directory without allowing its failures to abort the
 /// machine-wide pass. Global cleanup should still make progress when one old
 /// project has corrupt state, missing permissions, or a broken installation.
-async fn reap_state_dir(state_dir: &Path) -> Option<Reaped> {
-    let _lock = match StateLock::try_acquire(state_dir) {
+async fn reap_state_dir(state_dir: &Path, dry_run: bool) -> Option<Reaped> {
+    let lock = if dry_run {
+        StateLock::try_acquire_existing(state_dir)
+    } else {
+        StateLock::try_acquire(state_dir)
+    };
+    let _lock = match lock {
         Ok(Some(lock)) => lock,
         Ok(None) => return Some(Reaped::Busy),
         Err(error) => {
@@ -535,6 +540,7 @@ async fn reap_state_dir(state_dir: &Path) -> Option<Reaped> {
     }
     match probe(&state) {
         Liveness::Unverifiable(reason) => return Some(Reaped::Skipped { reason }),
+        Liveness::Running if dry_run => return Some(Reaped::Expired { state }),
         Liveness::Running => {
             if let Err(error) = PostgreSQL::new(settings_for(state_dir, &state))
                 .stop()
@@ -545,6 +551,7 @@ async fn reap_state_dir(state_dir: &Path) -> Option<Reaped> {
                 });
             }
         }
+        Liveness::NotRunning if dry_run => return Some(Reaped::Expired { state }),
         Liveness::NotRunning => {}
     }
     // An expired instance is disposed of, but `keep` still decides whether
@@ -889,7 +896,7 @@ mod tests {
         state.save(&state_dir).unwrap();
 
         assert!(matches!(
-            reap_state_dir(&state_dir).await,
+            reap_state_dir(&state_dir, false).await,
             Some(Reaped::Expired { .. })
         ));
         assert!(data_dir.join("marker").exists());
@@ -900,11 +907,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dry_run_reports_without_disposing_of_anything() {
+        let project = tempfile::tempdir().unwrap();
+        let state_dir = project.path().join("state");
+        let data_dir = state_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("marker"), "still here").unwrap();
+        let state = InstanceState {
+            project_dir: project.path().display().to_string(),
+            data_dir: data_dir.display().to_string(),
+            expires_at: Some(crate::state::now_unix() - 1),
+            keep: false,
+            ..sample()
+        };
+        drop(StateLock::acquire(&state_dir, false).unwrap());
+        state.save(&state_dir).unwrap();
+
+        assert!(matches!(
+            reap_state_dir(&state_dir, true).await,
+            Some(Reaped::Expired { .. })
+        ));
+        // Nothing wiped, and the deadline is left for the real sweep to act on.
+        assert!(data_dir.join("marker").exists());
+        assert_eq!(
+            InstanceState::load(&state_dir).unwrap().unwrap().expires_at,
+            state.expires_at
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_leaves_a_live_instance_alone() {
+        // An unexpired instance is reported as kept whether or not it is a run.
+        let project = tempfile::tempdir().unwrap();
+        let state_dir = project.path().join("state");
+        let state = InstanceState {
+            project_dir: project.path().display().to_string(),
+            expires_at: Some(crate::state::now_unix() + 3600),
+            ..sample()
+        };
+        drop(StateLock::acquire(&state_dir, false).unwrap());
+        state.save(&state_dir).unwrap();
+
+        assert!(matches!(
+            reap_state_dir(&state_dir, true).await,
+            Some(Reaped::Kept)
+        ));
+        assert!(matches!(
+            reap_state_dir(&state_dir, false).await,
+            Some(Reaped::Kept)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_does_not_create_a_missing_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = InstanceState {
+            data_dir: dir.path().join("data").display().to_string(),
+            expires_at: Some(crate::state::now_unix() - 1),
+            ..sample()
+        };
+        state.save(dir.path()).unwrap();
+
+        assert!(matches!(
+            reap_state_dir(dir.path(), true).await,
+            Some(Reaped::Skipped { .. })
+        ));
+        assert!(!dir.path().join(".lock").exists());
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_skips_an_unverifiable_expired_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let state = InstanceState {
+            data_dir: data_dir.display().to_string(),
+            installation_dir: dir.path().join("missing-install").display().to_string(),
+            port: 1,
+            expires_at: Some(crate::state::now_unix() - 1),
+            ..sample()
+        };
+        std::fs::write(
+            data_dir.join("postmaster.pid"),
+            format!(
+                "12345\n{}\n1723456789\n1\n/tmp\n127.0.0.1\n",
+                state.data_dir
+            ),
+        )
+        .unwrap();
+        drop(StateLock::acquire(dir.path(), false).unwrap());
+        state.save(dir.path()).unwrap();
+
+        assert!(matches!(
+            reap_state_dir(dir.path(), true).await,
+            Some(Reaped::Skipped { .. })
+        ));
+        assert!(data_dir.join("postmaster.pid").exists());
+    }
+
+    #[tokio::test]
     async fn corrupt_state_does_not_abort_a_gc_sweep() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("state.json"), "{ not json").unwrap();
 
-        let Some(Reaped::Skipped { reason }) = reap_state_dir(dir.path()).await else {
+        let Some(Reaped::Skipped { reason }) = reap_state_dir(dir.path(), false).await else {
             panic!("corrupt state should be skipped");
         };
         assert!(reason.contains("cannot load state"));

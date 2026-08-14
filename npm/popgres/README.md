@@ -43,6 +43,7 @@ interrupted CI job or agent session cannot leave it running indefinitely:
 
 ```sh
 npx popgres up --ttl 30m
+npx popgres gc --dry-run   # report what has expired, touching nothing
 npx popgres gc
 ```
 

@@ -76,7 +76,9 @@ a crash or an interrupted session cannot leave a database running forever:
 popgres up --ttl 30m --json
 ```
 
-Use a deadline comfortably longer than the work. `popgres gc --json` then
+Use a deadline comfortably longer than the work. Check what a sweep would
+remove with `popgres gc --dry-run --json`, which reports without stopping or
+wiping anything. `popgres gc --json` then
 disposes of anything past its deadline, in any project, and never touches an
 instance that has not expired. Prefer `popgres run`, which needs no deadline
 because it disposes of what it started. `--ttl` never replaces an explicit
@@ -93,7 +95,8 @@ Prefer JSON for automation:
 - `down --json`: `stopped`, `wiped`
 - `reset --json`: `reset`, `url`, `port`, `database`
 - `url --json`: `url`
-- `gc --json`: `reaped` (one object per disposed instance), `examined`
+- `gc --json`: `reaped` (one object per disposed instance), `examined`,
+  `dry_run`
 - `run --json`: newline-delimited lifecycle events on stderr; child stdout is
   unchanged
 

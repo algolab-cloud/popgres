@@ -38,7 +38,7 @@ npm install --save-dev @popgres/cli
 npx popgres run -- npm run dev
 ```
 
-Or install with Cargo:
+Or install with Cargo (requires Rust 1.94 or newer):
 
 ```sh
 cargo install popgres
@@ -89,6 +89,7 @@ whoever started it never comes back:
 
 ```sh
 popgres up --ttl 30m
+popgres gc --dry-run  # report what has expired, touching nothing
 popgres gc            # stops everything past its deadline, in every project
 ```
 
@@ -141,6 +142,7 @@ Add `--global` to make the skill available across all projects.
 
 - [npm](https://www.npmjs.com/package/@popgres/cli)
 - [crates.io](https://crates.io/crates/popgres)
+- [Changelog](CHANGELOG.md)
 - [Roadmap](PLAN.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)

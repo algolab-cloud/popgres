@@ -92,7 +92,11 @@ enum Command {
     /// Show whether this project's instance is running
     Status,
     /// Dispose of instances past their --ttl, in every project on this machine
-    Gc,
+    Gc {
+        /// Report what would be disposed of without stopping or wiping anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -150,7 +154,7 @@ async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Gc => commands::gc(json).await,
+        Command::Gc { dry_run } => commands::gc(dry_run, json).await,
     }
 }
 
@@ -241,7 +245,14 @@ mod tests {
 
     #[test]
     fn gc_is_a_global_cleanup_command() {
-        assert!(matches!(parse(&["popgres", "gc"]).command, Command::Gc));
+        assert!(matches!(
+            parse(&["popgres", "gc"]).command,
+            Command::Gc { dry_run: false }
+        ));
+        assert!(matches!(
+            parse(&["popgres", "gc", "--dry-run"]).command,
+            Command::Gc { dry_run: true }
+        ));
     }
 
     #[test]
