@@ -22,6 +22,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
 
+  msrv:
+    name: msrv (rust-version in Cargo.toml)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      # `cargo install popgres` compiles from source, so the declared minimum
+      # has to keep building with the current PostgreSQL/SQLx dependency chain.
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

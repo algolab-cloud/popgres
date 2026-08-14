@@ -326,8 +326,8 @@ pub async fn reset(json: bool) -> Result<()> {
 ///
 /// This is the only command that touches instances outside the current
 /// project, and it never destroys anything that has not expired.
-pub async fn gc(json: bool) -> Result<()> {
-    let swept = instance::gc().await?;
+pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
+    let swept = instance::gc(dry_run).await?;
     let mut reaped = Vec::new();
     for (state_dir, outcome) in &swept {
         match outcome {
@@ -336,14 +336,16 @@ pub async fn gc(json: bool) -> Result<()> {
                 emit_event(
                     json,
                     serde_json::json!({
-                        "event": "reaped",
+                        "event": if dry_run { "would_reap" } else { "reaped" },
                         "project_dir": state.project_dir,
                         "port": state.port,
                         "kept": state.keep,
                     }),
                     &format!(
-                        "popgres: reaped the expired instance for {} (port {})",
-                        state.project_dir, state.port
+                        "popgres: {} the expired instance for {} (port {})",
+                        if dry_run { "would reap" } else { "reaped" },
+                        state.project_dir,
+                        state.port
                     ),
                 );
             }
@@ -370,10 +372,16 @@ pub async fn gc(json: bool) -> Result<()> {
                     "kept": state.keep,
                 })).collect::<Vec<_>>(),
                 "examined": swept.len(),
+                "dry_run": dry_run,
             })
         );
     } else if reaped.is_empty() {
         println!("nothing to reap ({} instance(s) examined)", swept.len());
+    } else if dry_run {
+        println!(
+            "would reap {} expired instance(s) — rerun without --dry-run",
+            reaped.len()
+        );
     } else {
         println!("reaped {} expired instance(s)", reaped.len());
     }

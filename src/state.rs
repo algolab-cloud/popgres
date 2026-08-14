@@ -21,7 +21,7 @@ pub struct StateLock {
 
 impl StateLock {
     pub fn acquire(state_dir: &Path, json: bool) -> Result<Self> {
-        let (file, _path) = Self::open(state_dir)?;
+        let (file, _path) = Self::open(state_dir, true)?;
         // A blocked lock can mean minutes (another popgres downloading binaries
         // or running a seed) — say so instead of hanging silently.
         match file.try_lock() {
@@ -50,7 +50,20 @@ impl StateLock {
     /// `gc` walks projects it does not own, so it must never block on one that
     /// is mid-start: a busy project is simply skipped and reaped next sweep.
     pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
-        let (file, path) = Self::open(state_dir)?;
+        let (file, path) = Self::open(state_dir, true)?;
+        Self::try_lock(file, path)
+    }
+
+    /// Try to lock state without creating any file or directory.
+    ///
+    /// A dry-run must be strictly read-only. Old state without the stable lock
+    /// is therefore reported as unsafe to inspect instead of being modified.
+    pub fn try_acquire_existing(state_dir: &Path) -> Result<Option<Self>> {
+        let (file, path) = Self::open(state_dir, false)?;
+        Self::try_lock(file, path)
+    }
+
+    fn try_lock(file: File, path: PathBuf) -> Result<Option<Self>> {
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { _file: file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -60,12 +73,14 @@ impl StateLock {
         }
     }
 
-    fn open(state_dir: &Path) -> Result<(File, PathBuf)> {
-        std::fs::create_dir_all(state_dir)
-            .with_context(|| format!("cannot create {}", state_dir.display()))?;
+    fn open(state_dir: &Path, create: bool) -> Result<(File, PathBuf)> {
+        if create {
+            std::fs::create_dir_all(state_dir)
+                .with_context(|| format!("cannot create {}", state_dir.display()))?;
+        }
         let path = state_dir.join(LOCK_FILE);
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
+        options.read(true).write(true).create(create);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
