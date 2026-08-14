@@ -58,11 +58,13 @@ Windows x64. Standalone archives are available on
 | `popgres status` | Show its status, version, and port |
 | `popgres url` | Print its connection URL |
 | `popgres psql` | Open a `psql` shell |
+| `popgres testdb` | Clone a disposable test database from the seeded template |
 | `popgres reset` | Wipe and recreate the database |
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
 | `popgres list` | List every instance on this machine |
 | `popgres gc` | Dispose of instances past their `--ttl` |
+| `popgres cache` | Show disk usage; `--clean` reclaims unused items |
 
 Every command accepts `--json`. `run --json` keeps the child command's stdout
 untouched and writes newline-delimited lifecycle events to stderr. `psql
@@ -123,7 +125,94 @@ keep = false             # wipe data when stopped
 ttl = "30m"              # dispose of the instance after this long
 seed = "./db/seed.sql"   # run after fresh initialization
 env_file = ".env.local"  # write DATABASE_URL while running
+location = "local"       # or "global": keep the project tree free of db files
 ```
+
+## Test databases for parallel workers
+
+A fresh instance seeds a *template* database, locks it, and clones your
+working database from it. `popgres testdb` clones it again — a private,
+fully seeded database in about a tenth of a second:
+
+```sh
+DATABASE_URL=$(popgres testdb)   # one per test worker
+popgres testdb --clean           # drop every generated clone
+```
+
+Give each parallel test worker (`jest -w`, `pytest -n`) its own clone in a
+global setup hook and they stop colliding on shared rows and truncations.
+Clones are real databases: use transaction rollback or truncation *within* a
+worker as usual. `--name worker_1` names a clone; named clones are yours to
+drop. Because the working database is itself a clone of the template,
+`popgres reset` on a running instance is also fast: it rebuilds the template
+and re-clones in well under a second, on the same port, re-running your seed.
+
+## Extensions
+
+Declare PostgreSQL extensions in `popgres.toml` and popgres creates them
+before your seed runs — so seeds, migrations, and every `testdb` clone find
+them ready:
+
+```toml
+extensions = ["pg_trgm", "uuid-ossp", "pgcrypto"]
+```
+
+**The ~46 contrib extensions ship inside the PostgreSQL binaries popgres
+already downloads** — `pg_trgm`, `hstore`, `pgcrypto`, `citext`,
+`uuid-ossp`, `pg_stat_statements`, `ltree`, `cube`, `btree_gin`,
+`postgres_fdw`, and the rest of the standard set. Listing them costs
+nothing: no download, no extra disk.
+
+Downloaded extensions are also available — currently `vector` (pgvector,
+prebuilt for PostgreSQL 16) and `vectors` (pgvecto.rs):
+
+```toml
+pg_version = "16"
+extensions = ["vector", "pg_trgm"]
+```
+
+```sh
+popgres psql -- -c "SELECT '[1,2,3]'::vector <-> '[2,2,2]';"
+```
+
+The pristine PostgreSQL install is never modified. A project with downloaded
+extensions runs from a *variant* — an immutable copy of the base with the
+extensions installed — stored globally, built once per
+version-and-extension combination, and shared read-only by every project
+that wants the same one (building takes seconds; reuse is instant).
+Contrib-only projects skip variants entirely. `popgres gc` evicts variants
+no instance references anymore.
+
+Downloaded versions can be pinned with `[extensions_versions]` and follow
+each source repository's own numbering; contrib versions follow
+`pg_version`. Changing the extensions of a `keep = true` database requires
+`popgres reset`, and popgres says so rather than letting the postmaster
+fail. Extensions that no one publishes portable prebuilt binaries for
+(PostGIS, TimescaleDB, pg_cron) are not available; the error for an unknown
+name says what is.
+
+## Disk usage
+
+`popgres cache` shows everything popgres keeps on disk — PostgreSQL versions,
+extension variants, and each instance — with what is in use and what is not.
+`popgres cache --clean` removes unused extension variants; adding `--all`
+also removes PostgreSQL versions no popgres instance references (the download
+cache may be shared with other tools built on postgresql-embedded, so this
+step is opt-in). Instance data is never touched — that is what `down` and
+`gc` are for.
+
+## Where the database lives
+
+By default the instance lives in `.popgres/` inside the project, like `.git`
+or `node_modules`: delete the project and its database is gone with it. The
+directory ignores itself (its own `.gitignore`) and carries a `CACHEDIR.TAG`
+so backup tools skip it — nothing to add to your repository.
+
+Set `location = "global"` to keep the instance in the per-user data directory
+instead. Do this when the project lives in a synced folder (Dropbox, iCloud,
+OneDrive): syncing a live database directory risks corruption. Projects with
+an existing global instance keep using it until it is wiped; the next fresh
+start is local.
 
 The default instance is passwordless and listens only on loopback. Set
 `password` in `popgres.toml` when authentication is required. Keep configured

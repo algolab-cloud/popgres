@@ -33,11 +33,13 @@ npx @popgres/cli up
 | `popgres status` | Show status, version, port, and expiry |
 | `popgres url` | Print the connection URL |
 | `popgres psql` | Open a `psql` shell |
+| `popgres testdb` | Clone a disposable database from the seeded template |
 | `popgres reset` | Wipe and recreate the database |
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
 | `popgres list` | List every instance on this machine |
 | `popgres gc` | Dispose of instances past their TTL |
+| `popgres cache` | Show disk usage and reclaim unused cache entries |
 
 For a database shared by several commands, give it an expiry deadline so an
 interrupted CI job or agent session cannot leave it running indefinitely:
@@ -51,6 +53,43 @@ npx popgres gc
 Every command accepts `--json` for automation. Popgres also provides stable
 exit codes, serializes concurrent lifecycle changes, and verifies postmaster
 identity before adopting or wiping an instance.
+
+## Extensions included
+
+Declare extensions once in `popgres.toml`; popgres creates them before the
+seed runs, and every working or test database inherits them:
+
+```toml
+extensions = ["pg_trgm", "uuid-ossp", "pgcrypto"]
+```
+
+The standard PostgreSQL contrib set—around 46 extensions including `hstore`,
+`citext`, `ltree`, `cube`, `btree_gin`, and `postgres_fdw`—ships inside the
+PostgreSQL binaries already downloaded by popgres. There is no additional
+download or disk cost. Popgres also supports prebuilt downloaded extensions,
+including pgvector:
+
+```toml
+pg_version = "16"
+extensions = ["vector", "pg_trgm"]
+```
+
+## Isolated parallel test databases
+
+A fresh instance seeds a locked template. Create one private, fully seeded
+clone per parallel test worker in about a tenth of a second:
+
+```sh
+DATABASE_URL=$(npx popgres testdb)
+npx popgres testdb --clean
+```
+
+The working database is also cloned from that template, so extensions and
+seed data are identical everywhere. A running `popgres reset` rebuilds it on
+the same port without repeating a full PostgreSQL initialization.
+
+By default instance data lives in the project's self-ignoring `.popgres/`
+directory. Set `location = "global"` for projects in synced folders.
 
 ## How the npm package works
 

@@ -29,6 +29,29 @@ pub struct Config {
     pub ttl: Option<String>,
     /// File to write DATABASE_URL into when an instance starts.
     pub env_file: Option<PathBuf>,
+    /// Where the instance lives: "local" (`.popgres/` in the project, the
+    /// default) or "global" (the per-user data directory, keyed by path).
+    pub location: Option<Location>,
+    /// PostgreSQL extensions to install and create, e.g. ["vector"].
+    pub extensions: Option<Vec<String>>,
+    /// Optional version pins for entries in `extensions`,
+    /// e.g. vector = "=0.8.0". Unpinned extensions take the latest build.
+    pub extensions_versions: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Where a project's database lives.
+///
+/// Local is the default: the instance sits in `.popgres/` inside the project,
+/// so deleting the project deletes its database. Global keeps the project
+/// tree free of database files — the right choice for project directories
+/// that live in synced folders (Dropbox, iCloud), where a live data
+/// directory being synced risks corruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Location {
+    #[default]
+    Local,
+    Global,
 }
 
 impl Config {
@@ -41,6 +64,10 @@ impl Config {
     /// A fixed port, treating the documented `port = 0` as "pick a free one".
     pub fn fixed_port(&self) -> Option<u16> {
         self.port.filter(|port| *port != 0)
+    }
+
+    pub fn resolved_location(&self) -> Location {
+        self.location.unwrap_or_default()
     }
 }
 

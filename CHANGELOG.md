@@ -4,6 +4,54 @@ All notable changes to popgres are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the version
 is below 1.0, minor releases may change behavior.
 
+## 0.4.0
+
+### Changed
+
+- **Instances now live in `.popgres/` inside the project by default**, like
+  `.git` or `node_modules`: delete the project and its database goes with it.
+  The directory ignores itself and carries a `CACHEDIR.TAG` so version
+  control and backup tools skip it. Set `location = "global"` in
+  `popgres.toml` for the old behavior — recommended for projects in synced
+  folders (Dropbox, iCloud), where syncing a live data directory risks
+  corruption. A project with an existing global instance keeps using it until
+  that instance is wiped; the next fresh start is local.
+
+### Added
+
+- **Test databases from a template.** A fresh instance now seeds a template
+  database (`popgres_template`), locks it against connections, and clones the
+  working database from it. `popgres testdb` clones it again in ~0.1 s — one
+  private, fully seeded database per parallel test worker — and
+  `testdb --clean` drops every generated clone. Seeds now run against the
+  template (`DATABASE_URL` points there during seeding), so extensions and
+  seed data are inherited by every clone. `popgres reset` on a running
+  instance uses the same machinery: same port, seed re-run, well under a
+  second instead of a full re-initialization.
+- **PostgreSQL extensions.** `extensions = [...]` in `popgres.toml` creates
+  extensions before the seed hook runs. The ~46 bundled contrib extensions
+  (`pg_trgm`, `hstore`, `pgcrypto`, `citext`, `uuid-ossp`,
+  `pg_stat_statements`, …) work on every PostgreSQL version with no download
+  and no extra disk. Downloaded extensions — `vector` (pgvector) and
+  `vectors` (pgvecto.rs) — install into shared variants. The pristine
+  PostgreSQL install is never modified: projects with downloaded extensions
+  run from an immutable, globally shared *variant* built once per
+  version-and-extension combination. The first build takes seconds, every
+  later project reuses it instantly, and `popgres gc` evicts variants nothing
+  references. Version pins go in `[extensions_versions]`; changing a kept
+  database's extensions asks for `popgres reset` instead of letting the
+  postmaster fail. pgvector currently ships prebuilt for PostgreSQL 16, and
+  the error says exactly that if another version is requested.
+- A small global registry lets `list` and `gc` find local instances across
+  the machine; entries whose project or instance has been deleted are pruned
+  automatically.
+- `popgres cache` reports popgres's disk footprint — PostgreSQL versions,
+  extension variants, and instances, each marked in use or unused — and
+  `cache --clean` reclaims unused variants (`--all` extends to PostgreSQL
+  versions nothing references; the download cache can be shared with other
+  postgresql-embedded tools, so that step is opt-in). Instance data is never
+  touched.
+
 ## 0.3.0
 
 ### Added

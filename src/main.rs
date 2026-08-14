@@ -4,11 +4,14 @@
 //! No system install, no Docker: real PostgreSQL binaries are fetched once,
 //! cached globally, and run as a plain local process.
 
+mod cache;
 mod commands;
 mod config;
 mod error;
+mod extensions;
 mod instance;
 mod project;
+mod registry;
 mod seed;
 mod state;
 
@@ -87,6 +90,19 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Create a disposable test database cloned from the seeded template
+    ///
+    /// Intended use: one clone per parallel test worker (`jest -w`, `pytest -n`),
+    /// created in a global setup hook. Each clone starts as an exact copy of the
+    /// seeded database, in about a tenth of a second.
+    Testdb {
+        /// Name the clone yourself (default: <database>_t_<random>)
+        #[arg(long, conflicts_with = "clean")]
+        name: Option<String>,
+        /// Drop every generated test database; the template stays
+        #[arg(long)]
+        clean: bool,
+    },
     /// Wipe the data and start again from a fresh database, even if it was kept
     Reset,
     /// Show whether this project's instance is running
@@ -98,6 +114,16 @@ enum Command {
         /// Report what would be disposed of without stopping or wiping anything
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Show popgres's disk usage: PostgreSQL versions, extension variants, instances
+    Cache {
+        /// Remove unused extension variants
+        #[arg(long)]
+        clean: bool,
+        /// With --clean, also remove PostgreSQL versions no popgres instance
+        /// uses (the download cache may be shared with other tools)
+        #[arg(long, requires = "clean")]
+        all: bool,
     },
 }
 
@@ -149,6 +175,7 @@ async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
         Command::Down { keep, wipe } => commands::down(keep, wipe, json).await,
         Command::Url => commands::url(json),
         Command::Psql { args } => commands::psql(args),
+        Command::Testdb { name, clean } => commands::testdb(name, clean, json),
         Command::Reset => commands::reset(json).await,
         Command::Status => {
             if !commands::status(json)? {
@@ -158,6 +185,7 @@ async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
         }
         Command::List => commands::list(json),
         Command::Gc { dry_run } => commands::gc(dry_run, json).await,
+        Command::Cache { clean, all } => commands::cache(clean, all, json),
     }
 }
 
@@ -250,6 +278,26 @@ mod tests {
     fn list_is_a_global_read_only_command() {
         assert!(matches!(parse(&["popgres", "list"]).command, Command::List));
         assert!(parse(&["popgres", "list", "--json"]).json);
+    }
+
+    #[test]
+    fn testdb_takes_a_name_or_clean_but_not_both() {
+        assert!(matches!(
+            parse(&["popgres", "testdb"]).command,
+            Command::Testdb {
+                name: None,
+                clean: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["popgres", "testdb", "--name", "worker_1"]).command,
+            Command::Testdb { name: Some(_), .. }
+        ));
+        assert!(matches!(
+            parse(&["popgres", "testdb", "--clean"]).command,
+            Command::Testdb { clean: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["popgres", "testdb", "--name", "x", "--clean"]).is_err());
     }
 
     #[test]

@@ -18,6 +18,15 @@ use crate::ENV_VAR;
 const DEFAULT_DATABASE: &str = "db";
 const LOCALHOST: &str = "127.0.0.1";
 
+/// The seeded, connection-locked template every fresh database is cloned
+/// from. Fixed and unmistakably popgres's own, so it can never collide with
+/// a user's database name.
+pub const TEMPLATE_DB: &str = "popgres_template";
+
+/// The maintenance database used for create/drop statements — initdb always
+/// provides it, and it is never one popgres manages.
+pub const MAINTENANCE_DB: &str = "postgres";
+
 pub struct Started {
     pub state: InstanceState,
     /// We found it already running and adopted it, rather than starting it.
@@ -124,13 +133,25 @@ pub enum Entry {
     Unreadable { state_dir: PathBuf, reason: String },
 }
 
+/// Every state directory a machine-wide command should visit: the global
+/// state root plus every registered local `.popgres/`.
+pub(crate) fn discoverable_state_dirs() -> Result<Vec<PathBuf>> {
+    let mut dirs = crate::state::all_state_dirs()?;
+    dirs.extend(crate::registry::local_state_dirs()?);
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
+}
+
 /// Every instance popgres knows about, across all projects.
 ///
-/// Strictly read-only: it takes no lock and creates nothing, so surveying the
-/// machine can never disturb a project mid-start or leave files behind.
+/// Read-only towards instances: it takes no project lock and touches no
+/// project state, so surveying can never disturb a project mid-start. (The
+/// registry of local projects is popgres's own bookkeeping and prunes as it
+/// is read.)
 pub fn list() -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    for state_dir in crate::state::all_state_dirs()? {
+    for state_dir in discoverable_state_dirs()? {
         match InstanceState::load(&state_dir) {
             Ok(Some(state)) => {
                 let liveness = probe(&state);
@@ -225,6 +246,7 @@ fn settings_for(state_dir: &Path, state: &InstanceState) -> Settings {
     base_settings(state_dir)
         .version(VersionReq::from_str(&state.pg_version).unwrap_or_default())
         .installation_dir(PathBuf::from(&state.installation_dir))
+        .trust_installation_dir(true)
         .data_dir(PathBuf::from(&state.data_dir))
         .host(state.host.clone())
         .port(state.port)
@@ -246,6 +268,13 @@ pub async fn start(
     json: bool,
 ) -> Result<Started> {
     let _lock = StateLock::acquire(&project.state_dir, json)?;
+    if project.local {
+        // A `.popgres/` inside the project must ignore itself and read as a
+        // cache to backup tools, and machine-wide commands find it through
+        // the registry — the global state root no longer sees it.
+        crate::state::ensure_local_markers(&project.state_dir)?;
+        crate::registry::register(&project.root)?;
+    }
     start_locked(project, keep, port, pg, ttl, json).await
 }
 
@@ -259,6 +288,53 @@ pub async fn stop(project: &Project, state: &InstanceState, keep: bool, json: bo
 /// which reset deliberately holds on to — between the stop and the start.
 pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Result<Started> {
     let _lock = StateLock::acquire(&project.state_dir, json)?;
+    let Some(current) = InstanceState::load(&project.state_dir)? else {
+        bail!("no popgres instance found for this project — run `popgres up` first");
+    };
+    if current != *state {
+        bail!("the popgres instance changed while waiting for the state lock — retry the command");
+    }
+
+    // A running instance resets without touching the postmaster: drop every
+    // popgres-managed database and let the caller rebuild the template and
+    // clone `db` from it. Same port, same URL, hundreds of milliseconds
+    // instead of a full initdb — and the seed hook still re-runs, so a
+    // changed seed takes effect. Anything else (stopped, unverifiable) takes
+    // the full stop-and-reinitialize path.
+    let extension_specs = crate::extensions::specs(&project.config)?;
+    let extensions_unchanged = crate::extensions::resume_compatible(
+        &current.extensions,
+        &current.installation_dir,
+        &current.pg_version,
+        &extension_specs,
+    );
+    if extensions_unchanged && matches!(probe(&current), Liveness::Running) {
+        let managed = psql_rows(
+            &current,
+            MAINTENANCE_DB,
+            "SELECT datname FROM pg_database \
+             WHERE datname NOT IN ('postgres', 'template0', 'template1')",
+        )?;
+        for database in managed {
+            psql_exec(
+                &current,
+                MAINTENANCE_DB,
+                &format!("DROP DATABASE {} WITH (FORCE)", quote_identifier(&database)),
+            )?;
+        }
+        psql_exec(
+            &current,
+            MAINTENANCE_DB,
+            &format!("CREATE DATABASE {}", quote_identifier(TEMPLATE_DB)),
+        )?;
+        project.write_env_file(&current.url())?;
+        return Ok(Started {
+            state: current,
+            already_running: false,
+            freshly_initialized: true,
+        });
+    }
+
     stop_locked(project, state, false).await?;
     start_locked(
         project,
@@ -269,6 +345,52 @@ pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Resu
         json,
     )
     .await
+}
+
+/// Run one SQL statement through the instance's own `psql`, against a chosen
+/// database. Errors carry psql's stderr.
+pub fn psql_exec(state: &InstanceState, database: &str, sql: &str) -> Result<()> {
+    psql_capture(state, database, sql).map(|_| ())
+}
+
+/// Rows of a single-column query, one per line.
+pub fn psql_rows(state: &InstanceState, database: &str, sql: &str) -> Result<Vec<String>> {
+    Ok(psql_capture(state, database, sql)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Quote a PostgreSQL identifier for SQL assembled by popgres itself.
+pub fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn psql_capture(state: &InstanceState, database: &str, sql: &str) -> Result<String> {
+    let psql = psql_binary(state)?;
+    let output = std::process::Command::new(&psql)
+        .arg(state.url_for(database))
+        .args([
+            "--quiet",
+            "--no-psqlrc",
+            "-t",
+            "-A",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
+        .output()
+        .with_context(|| format!("failed to run {}", psql.display()))?;
+    if !output.status.success() {
+        bail!(
+            "psql failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn start_locked(
@@ -387,9 +509,20 @@ async fn start_locked(
             .username(previous.username.clone())
             .password(previous.password.clone())
             .installation_dir(PathBuf::from(&previous.installation_dir))
+            // The recorded dir is always a concrete install (base or extension
+            // variant); resolving it again would download a copy inside it.
+            .trust_installation_dir(true)
             .version(VersionReq::from_str(&previous.pg_version).unwrap_or_default());
 
         ensure_resume_version_matches(&data_dir, previous, pg.as_deref())?;
+        // The kept catalog was built against a specific extension set; a
+        // config change under it needs a rebuild, said plainly.
+        crate::extensions::check_resume(
+            &previous.extensions,
+            &previous.installation_dir,
+            &previous.pg_version,
+            &crate::extensions::specs(&project.config)?,
+        )?;
     }
 
     // Only a fresh instance can take a configured password: an existing role
@@ -425,6 +558,53 @@ async fn start_locked(
         .await
         .context("failed to set up Postgres")?;
 
+    // `setup` resolves the requirement to a concrete install, and the
+    // directory it picked is named for the version we actually got —
+    // `settings.version` may still be the bare requirement (`*`). Read it
+    // now: a variant swap below renames the directory to the variant key,
+    // which must never leak into the recorded version.
+    let resolved_pg_version = postgresql
+        .settings()
+        .installation_dir
+        .file_name()
+        .map_or_else(
+            || postgresql.settings().version.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+
+    let extension_specs = crate::extensions::specs(&project.config)?;
+    // Contrib extensions ship inside the install itself — verify they exist
+    // for this version now, while the error can still explain the options.
+    if !resuming {
+        crate::extensions::ensure_contrib_available(
+            &postgresql.settings().installation_dir,
+            &extension_specs,
+        )?;
+    }
+
+    // Packaged extensions never touch the pristine base install: a fresh
+    // start with any configured runs from a variant — a shared, immutable
+    // clone of the base with the extensions installed. Contrib-only configs
+    // skip all of this and run straight off the base. (A resume already
+    // points at its variant through the saved installation_dir.)
+    let packaged_specs = crate::extensions::packaged(&extension_specs);
+    if !resuming && !packaged_specs.is_empty() {
+        let variant =
+            crate::extensions::ensure_variant(postgresql.settings(), &packaged_specs, json).await?;
+        let mut settings = postgresql.settings().clone();
+        settings.installation_dir = variant;
+        // Without this the crate re-resolves the (possibly inexact) version
+        // requirement and extracts a pristine install *inside* the variant —
+        // and then runs that copy, which has no extensions.
+        settings.trust_installation_dir = true;
+        postgresql = PostgreSQL::new(settings);
+        // Installed and initialized already, so this only revalidates.
+        postgresql
+            .setup()
+            .await
+            .context("failed to adopt the extension variant")?;
+    }
+
     // With no password configured, drop the auth requirement entirely — the
     // server only listens on loopback, and a URL with no secret in it is far
     // easier to paste, log, and hand to an agent.
@@ -447,15 +627,20 @@ async fn start_locked(
         return Err(start_error).context("failed to start Postgres");
     }
 
-    if !postgresql
-        .database_exists(&database)
-        .await
-        .context("failed to check database")?
+    // A fresh instance gets the template database only; the caller seeds it,
+    // locks it, and clones `database` from it — so `database` is born
+    // identical to every future test database. A resumed instance already
+    // has both.
+    if !resuming
+        && !postgresql
+            .database_exists(TEMPLATE_DB)
+            .await
+            .context("failed to check the template database")?
     {
         postgresql
-            .create_database(&database)
+            .create_database(TEMPLATE_DB)
             .await
-            .context("failed to create database")?;
+            .context("failed to create the template database")?;
     }
 
     let settings = postgresql.settings();
@@ -475,15 +660,10 @@ async fn start_locked(
             settings.password.clone()
         },
         database,
-        // `setup` resolves the requirement to a concrete install, and the
-        // directory it picked is named for the version we actually got —
-        // `settings.version` may still be the bare requirement (`*`).
-        pg_version: settings.installation_dir.file_name().map_or_else(
-            || settings.version.to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        ),
+        pg_version: resolved_pg_version,
         postmaster_pid: Some(postmaster_pid),
         expires_at,
+        extensions: crate::extensions::names(&extension_specs),
         keep,
     };
     state.save(state_dir)?;
@@ -533,7 +713,7 @@ async fn stop_locked(project: &Project, state: &InstanceState, keep: bool) -> Re
 /// What a `gc` sweep did to one state directory.
 pub enum Reaped {
     /// The instance passed its deadline and was disposed of.
-    Expired { state: InstanceState },
+    Expired { state: Box<InstanceState> },
     /// Still within its TTL, or has none at all.
     Kept,
     /// Another popgres process holds the lock; try again next sweep.
@@ -547,14 +727,25 @@ pub enum Reaped {
 /// Each project is taken under its own lock and skipped if busy, so a sweep can
 /// never interrupt a start in progress. An instance whose liveness cannot be
 /// confirmed is reported rather than wiped, exactly as `stop` treats it.
-pub async fn gc(dry_run: bool) -> Result<Vec<(PathBuf, Reaped)>> {
+pub async fn gc(dry_run: bool) -> Result<(Vec<(PathBuf, Reaped)>, Vec<String>)> {
+    let state_dirs = discoverable_state_dirs()?;
+    // Collected before the sweep, so a variant referenced only by an
+    // instance reaped this pass survives until the next one — conservative
+    // by a single cycle, never wrong.
+    let referenced: Vec<PathBuf> = state_dirs
+        .iter()
+        .filter_map(|dir| InstanceState::load(dir).ok().flatten())
+        .map(|state| PathBuf::from(state.installation_dir))
+        .collect();
+
     let mut swept = Vec::new();
-    for state_dir in crate::state::all_state_dirs()? {
+    for state_dir in state_dirs {
         if let Some(outcome) = reap_state_dir(&state_dir, dry_run).await {
             swept.push((state_dir, outcome));
         }
     }
-    Ok(swept)
+    let evicted = crate::extensions::evict_unreferenced(&referenced, dry_run)?;
+    Ok((swept, evicted))
 }
 
 /// Sweep one state directory without allowing its failures to abort the
@@ -590,7 +781,11 @@ async fn reap_state_dir(state_dir: &Path, dry_run: bool) -> Option<Reaped> {
     }
     match probe(&state) {
         Liveness::Unverifiable(reason) => return Some(Reaped::Skipped { reason }),
-        Liveness::Running if dry_run => return Some(Reaped::Expired { state }),
+        Liveness::Running if dry_run => {
+            return Some(Reaped::Expired {
+                state: Box::new(state),
+            })
+        }
         Liveness::Running => {
             if let Err(error) = PostgreSQL::new(settings_for(state_dir, &state))
                 .stop()
@@ -601,7 +796,11 @@ async fn reap_state_dir(state_dir: &Path, dry_run: bool) -> Option<Reaped> {
                 });
             }
         }
-        Liveness::NotRunning if dry_run => return Some(Reaped::Expired { state }),
+        Liveness::NotRunning if dry_run => {
+            return Some(Reaped::Expired {
+                state: Box::new(state),
+            })
+        }
         Liveness::NotRunning => {}
     }
     // An expired instance is disposed of, but `keep` still decides whether
@@ -628,7 +827,9 @@ async fn reap_state_dir(state_dir: &Path, dry_run: bool) -> Option<Reaped> {
     if let Ok(project) = Project::at(Path::new(&state.project_dir)) {
         project.clear_env_file().ok();
     }
-    Some(Reaped::Expired { state })
+    Some(Reaped::Expired {
+        state: Box::new(state),
+    })
 }
 
 fn read_postmaster_pid(data_dir: &Path) -> Result<u32> {
@@ -767,6 +968,7 @@ mod tests {
             pg_version: "18.4.0".to_string(),
             postmaster_pid: Some(12345),
             expires_at: None,
+            extensions: Vec::new(),
             keep: false,
         }
     }
