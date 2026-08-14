@@ -126,7 +126,7 @@ pub enum Entry {
 
 /// Every state directory a machine-wide command should visit: the global
 /// state root plus every registered local `.popgres/`.
-fn discoverable_state_dirs() -> Result<Vec<PathBuf>> {
+pub(crate) fn discoverable_state_dirs() -> Result<Vec<PathBuf>> {
     let mut dirs = crate::state::all_state_dirs()?;
     dirs.extend(crate::registry::local_state_dirs()?);
     dirs.sort();
@@ -237,6 +237,7 @@ fn settings_for(state_dir: &Path, state: &InstanceState) -> Settings {
     base_settings(state_dir)
         .version(VersionReq::from_str(&state.pg_version).unwrap_or_default())
         .installation_dir(PathBuf::from(&state.installation_dir))
+        .trust_installation_dir(true)
         .data_dir(PathBuf::from(&state.data_dir))
         .host(state.host.clone())
         .port(state.port)
@@ -406,9 +407,18 @@ async fn start_locked(
             .username(previous.username.clone())
             .password(previous.password.clone())
             .installation_dir(PathBuf::from(&previous.installation_dir))
+            // The recorded dir is always a concrete install (base or extension
+            // variant); resolving it again would download a copy inside it.
+            .trust_installation_dir(true)
             .version(VersionReq::from_str(&previous.pg_version).unwrap_or_default());
 
         ensure_resume_version_matches(&data_dir, previous, pg.as_deref())?;
+        // The kept catalog was built against a specific extension set; a
+        // config change under it needs a rebuild, said plainly.
+        crate::extensions::check_resume_extensions(
+            &previous.installation_dir,
+            &crate::extensions::specs(&project.config)?,
+        )?;
     }
 
     // Only a fresh instance can take a configured password: an existing role
@@ -443,6 +453,43 @@ async fn start_locked(
         .setup()
         .await
         .context("failed to set up Postgres")?;
+
+    // `setup` resolves the requirement to a concrete install, and the
+    // directory it picked is named for the version we actually got —
+    // `settings.version` may still be the bare requirement (`*`). Read it
+    // now: a variant swap below renames the directory to the variant key,
+    // which must never leak into the recorded version.
+    let resolved_pg_version = postgresql
+        .settings()
+        .installation_dir
+        .file_name()
+        .map_or_else(
+            || postgresql.settings().version.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+
+    // Extensions never touch the pristine base install: a fresh start with
+    // extensions configured runs from a variant — a shared, immutable clone
+    // of the base with the extensions installed. (A resume already points at
+    // its variant through the saved installation_dir.)
+    let extension_specs = crate::extensions::specs(&project.config)?;
+    if !resuming && !extension_specs.is_empty() {
+        let variant =
+            crate::extensions::ensure_variant(postgresql.settings(), &extension_specs, json)
+                .await?;
+        let mut settings = postgresql.settings().clone();
+        settings.installation_dir = variant;
+        // Without this the crate re-resolves the (possibly inexact) version
+        // requirement and extracts a pristine install *inside* the variant —
+        // and then runs that copy, which has no extensions.
+        settings.trust_installation_dir = true;
+        postgresql = PostgreSQL::new(settings);
+        // Installed and initialized already, so this only revalidates.
+        postgresql
+            .setup()
+            .await
+            .context("failed to adopt the extension variant")?;
+    }
 
     // With no password configured, drop the auth requirement entirely — the
     // server only listens on loopback, and a URL with no secret in it is far
@@ -494,13 +541,7 @@ async fn start_locked(
             settings.password.clone()
         },
         database,
-        // `setup` resolves the requirement to a concrete install, and the
-        // directory it picked is named for the version we actually got —
-        // `settings.version` may still be the bare requirement (`*`).
-        pg_version: settings.installation_dir.file_name().map_or_else(
-            || settings.version.to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        ),
+        pg_version: resolved_pg_version,
         postmaster_pid: Some(postmaster_pid),
         expires_at,
         keep,
@@ -566,14 +607,25 @@ pub enum Reaped {
 /// Each project is taken under its own lock and skipped if busy, so a sweep can
 /// never interrupt a start in progress. An instance whose liveness cannot be
 /// confirmed is reported rather than wiped, exactly as `stop` treats it.
-pub async fn gc(dry_run: bool) -> Result<Vec<(PathBuf, Reaped)>> {
+pub async fn gc(dry_run: bool) -> Result<(Vec<(PathBuf, Reaped)>, Vec<String>)> {
+    let state_dirs = discoverable_state_dirs()?;
+    // Collected before the sweep, so a variant referenced only by an
+    // instance reaped this pass survives until the next one — conservative
+    // by a single cycle, never wrong.
+    let referenced: Vec<PathBuf> = state_dirs
+        .iter()
+        .filter_map(|dir| InstanceState::load(dir).ok().flatten())
+        .map(|state| PathBuf::from(state.installation_dir))
+        .collect();
+
     let mut swept = Vec::new();
-    for state_dir in discoverable_state_dirs()? {
+    for state_dir in state_dirs {
         if let Some(outcome) = reap_state_dir(&state_dir, dry_run).await {
             swept.push((state_dir, outcome));
         }
     }
-    Ok(swept)
+    let evicted = crate::extensions::evict_unreferenced(&referenced, dry_run)?;
+    Ok((swept, evicted))
 }
 
 /// Sweep one state directory without allowing its failures to abort the

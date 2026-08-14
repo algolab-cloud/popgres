@@ -96,7 +96,10 @@ Prefer JSON for automation:
 - `reset --json`: `reset`, `url`, `port`, `database`
 - `url --json`: `url`
 - `gc --json`: `reaped` (one object per disposed instance), `examined`,
-  `dry_run`
+  `evicted_variants`, `dry_run`
+- `cache --json`: `postgres`, `variants`, `instances` (each entry with
+  `name`, `size_bytes`, `referenced`), `total_bytes`, `removed`. Only run
+  `cache --clean` when the user asks to reclaim disk space.
 - `list --json`: `instances` (each with `project_dir`, `status`, `running`,
   `port`, `pg_version`, `database`, `keep`, `expires_at`, `expired`,
   `current`), `count`. Read-only, and never includes connection URLs.
@@ -135,6 +138,12 @@ ignores itself, so never add it to the repository's `.gitignore` or commit
 it. Deleting `.popgres/` disposes of the instance data. Set
 `location = "global"` for projects inside synced folders (Dropbox, iCloud,
 OneDrive) — syncing a live database directory risks corruption.
+
+For vector search, add `extensions = ["vector"]` with `pg_version = "16"`
+(pgvector currently ships prebuilt for PostgreSQL 16 only). The extension is
+installed and created before the seed hook runs, so seeds and migrations can
+use `vector` columns immediately. Changing the extensions of a kept database
+requires `popgres reset`.
 
 Use `port = 0` for collision-free allocation. Omit `password` for the default
 passwordless loopback-only instance. A `seed` SQL file or shell command runs

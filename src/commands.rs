@@ -36,9 +36,14 @@ fn instance_payload(state: &InstanceState, already_running: bool) -> serde_json:
     })
 }
 
-/// Run the seed hook against a freshly initialized database.
+/// Ready a freshly initialized database: create the configured extensions,
+/// then run the seed hook — in that order, so seeds can use the extensions.
 fn seed_if_fresh(project: &Project, started: &Started, json: bool) -> Result<()> {
     if started.freshly_initialized {
+        let specs = crate::extensions::specs(&project.config)?;
+        if !specs.is_empty() {
+            crate::extensions::create_in_database(&started.state, &specs)?;
+        }
         if let Some(recipe) = project.config.seed.as_deref() {
             seed::run(project, &started.state, recipe, json)?;
         }
@@ -465,7 +470,7 @@ fn ttl_label(expires_at: Option<u64>, now: u64) -> String {
 }
 
 pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
-    let swept = instance::gc(dry_run).await?;
+    let (swept, evicted_variants) = instance::gc(dry_run).await?;
     let mut reaped = Vec::new();
     for (state_dir, outcome) in &swept {
         match outcome {
@@ -500,6 +505,20 @@ pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
         }
     }
 
+    for variant in &evicted_variants {
+        emit_event(
+            json,
+            serde_json::json!({
+                "event": if dry_run { "would_evict_variant" } else { "evicted_variant" },
+                "variant": variant,
+            }),
+            &format!(
+                "popgres: {} unused extension variant {variant}",
+                if dry_run { "would evict" } else { "evicted" }
+            ),
+        );
+    }
+
     if json {
         println!(
             "{}",
@@ -510,18 +529,104 @@ pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
                     "kept": state.keep,
                 })).collect::<Vec<_>>(),
                 "examined": swept.len(),
+                "evicted_variants": evicted_variants,
                 "dry_run": dry_run,
             })
         );
-    } else if reaped.is_empty() {
+    } else if reaped.is_empty() && evicted_variants.is_empty() {
         println!("nothing to reap ({} instance(s) examined)", swept.len());
     } else if dry_run {
         println!(
-            "would reap {} expired instance(s) — rerun without --dry-run",
-            reaped.len()
+            "would reap {} expired instance(s) and evict {} unused variant(s) — rerun without --dry-run",
+            reaped.len(),
+            evicted_variants.len()
         );
     } else {
-        println!("reaped {} expired instance(s)", reaped.len());
+        println!(
+            "reaped {} expired instance(s), evicted {} unused variant(s)",
+            reaped.len(),
+            evicted_variants.len()
+        );
+    }
+    Ok(())
+}
+
+/// Report popgres's disk footprint, and reclaim what nothing references.
+pub fn cache(clean: bool, all: bool, json: bool) -> Result<()> {
+    let report = crate::cache::Report::gather()?;
+    let removed = if clean {
+        crate::cache::clean(&report, all)?
+    } else {
+        Vec::new()
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "postgres": report.postgres,
+                "variants": report.variants,
+                "instances": report.instances,
+                "total_bytes": report.total_bytes,
+                "removed": removed,
+            })
+        );
+        return Ok(());
+    }
+
+    let verdict = |referenced: bool| if referenced { "in use" } else { "unused" };
+    if !report.postgres.is_empty() {
+        println!("PostgreSQL installs (shared download cache):");
+        for entry in &report.postgres {
+            println!(
+                "  {:<26} {:>9}  {}",
+                entry.name,
+                crate::cache::human_size(entry.size_bytes),
+                verdict(entry.referenced)
+            );
+        }
+    }
+    if !report.variants.is_empty() {
+        println!("Extension variants:");
+        for entry in &report.variants {
+            println!(
+                "  {:<26} {:>9}  {}",
+                entry.name,
+                crate::cache::human_size(entry.size_bytes),
+                verdict(entry.referenced)
+            );
+        }
+    }
+    if !report.instances.is_empty() {
+        println!("Instances:");
+        for entry in &report.instances {
+            println!(
+                "  {:<26} {:>9}",
+                entry.name,
+                crate::cache::human_size(entry.size_bytes)
+            );
+        }
+    }
+    println!("total: {}", crate::cache::human_size(report.total_bytes));
+
+    if clean {
+        if removed.is_empty() {
+            println!("nothing unused to remove");
+        } else {
+            println!("removed: {}", removed.join(", "));
+        }
+    } else {
+        let reclaimable: u64 = report
+            .removable(true)
+            .iter()
+            .map(|entry| entry.size_bytes)
+            .sum();
+        if reclaimable > 0 {
+            println!(
+                "reclaimable: {} — run `popgres cache --clean` (add --all to include unused PostgreSQL versions)",
+                crate::cache::human_size(reclaimable)
+            );
+        }
     }
     Ok(())
 }

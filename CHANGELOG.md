@@ -19,9 +19,25 @@ is below 1.0, minor releases may change behavior.
 
 ### Added
 
+- **PostgreSQL extensions.** `extensions = ["vector"]` in `popgres.toml`
+  installs pgvector (or `vectors` for pgvecto.rs) and creates it before the
+  seed hook runs. The pristine PostgreSQL install is never modified: projects
+  with extensions run from an immutable, globally shared *variant* built once
+  per version-and-extension combination — the first build takes seconds,
+  every later project reuses it instantly, and `popgres gc` evicts variants
+  nothing references. Version pins go in `[extensions_versions]`; changing a
+  kept database's extensions asks for `popgres reset` instead of letting the
+  postmaster fail. pgvector currently ships prebuilt for PostgreSQL 16, and
+  the error says exactly that if another version is requested.
 - A small global registry lets `list` and `gc` find local instances across
   the machine; entries whose project or instance has been deleted are pruned
   automatically.
+- `popgres cache` reports popgres's disk footprint — PostgreSQL versions,
+  extension variants, and instances, each marked in use or unused — and
+  `cache --clean` reclaims unused variants (`--all` extends to PostgreSQL
+  versions nothing references; the download cache can be shared with other
+  postgresql-embedded tools, so that step is opt-in). Instance data is never
+  touched.
 
 ## 0.3.0
 

@@ -4,9 +4,11 @@
 //! No system install, no Docker: real PostgreSQL binaries are fetched once,
 //! cached globally, and run as a plain local process.
 
+mod cache;
 mod commands;
 mod config;
 mod error;
+mod extensions;
 mod instance;
 mod project;
 mod registry;
@@ -100,6 +102,16 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show popgres's disk usage: PostgreSQL versions, extension variants, instances
+    Cache {
+        /// Remove unused extension variants
+        #[arg(long)]
+        clean: bool,
+        /// With --clean, also remove PostgreSQL versions no popgres instance
+        /// uses (the download cache may be shared with other tools)
+        #[arg(long, requires = "clean")]
+        all: bool,
+    },
 }
 
 #[tokio::main]
@@ -159,6 +171,7 @@ async fn dispatch(command: Command, json: bool) -> anyhow::Result<()> {
         }
         Command::List => commands::list(json),
         Command::Gc { dry_run } => commands::gc(dry_run, json).await,
+        Command::Cache { clean, all } => commands::cache(clean, all, json),
     }
 }
 

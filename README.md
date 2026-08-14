@@ -63,6 +63,7 @@ Windows x64. Standalone archives are available on
 | `popgres down --keep` | Stop and preserve its data |
 | `popgres list` | List every instance on this machine |
 | `popgres gc` | Dispose of instances past their `--ttl` |
+| `popgres cache` | Show disk usage; `--clean` reclaims unused items |
 
 Every command accepts `--json`. `run --json` keeps the child command's stdout
 untouched and writes newline-delimited lifecycle events to stderr. `psql
@@ -125,6 +126,43 @@ seed = "./db/seed.sql"   # run after fresh initialization
 env_file = ".env.local"  # write DATABASE_URL while running
 location = "local"       # or "global": keep the project tree free of db files
 ```
+
+## Extensions
+
+Declare PostgreSQL extensions in `popgres.toml` and popgres installs and
+creates them before your seed runs:
+
+```toml
+pg_version = "16"        # pgvector currently ships prebuilt for PostgreSQL 16
+extensions = ["vector"]
+```
+
+```sh
+popgres psql -- -c "SELECT '[1,2,3]'::vector <-> '[2,2,2]';"
+```
+
+The pristine PostgreSQL install is never modified. A project with extensions
+runs from a *variant* — an immutable copy of the base with the extensions
+installed — stored globally, built once per version-and-extension
+combination, and shared read-only by every project that wants the same one
+(building takes seconds; reuse is instant). `popgres gc` evicts variants no
+instance references anymore.
+
+Available extensions: `vector` (pgvector) and `vectors` (pgvecto.rs).
+Versions can be pinned with `[extensions_versions]` and follow each source
+repository's own numbering. Changing the extensions of a `keep = true`
+database requires `popgres reset`, and popgres says so rather than letting
+the postmaster fail.
+
+## Disk usage
+
+`popgres cache` shows everything popgres keeps on disk — PostgreSQL versions,
+extension variants, and each instance — with what is in use and what is not.
+`popgres cache --clean` removes unused extension variants; adding `--all`
+also removes PostgreSQL versions no popgres instance references (the download
+cache may be shared with other tools built on postgresql-embedded, so this
+step is opt-in). Instance data is never touched — that is what `down` and
+`gc` are for.
 
 ## Where the database lives
 

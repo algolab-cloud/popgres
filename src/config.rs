@@ -32,6 +32,11 @@ pub struct Config {
     /// Where the instance lives: "local" (`.popgres/` in the project, the
     /// default) or "global" (the per-user data directory, keyed by path).
     pub location: Option<Location>,
+    /// PostgreSQL extensions to install and create, e.g. ["vector"].
+    pub extensions: Option<Vec<String>>,
+    /// Optional version pins for entries in `extensions`,
+    /// e.g. vector = "=0.8.0". Unpinned extensions take the latest build.
+    pub extensions_versions: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Where a project's database lives.
