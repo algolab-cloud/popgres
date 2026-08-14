@@ -49,7 +49,24 @@ Windows x64. Standalone archives are available on
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
 
-Use `--json` with `up`, `status`, `reset`, and `down` for automation.
+Every command accepts `--json`. `run --json` keeps the child command's stdout
+untouched and writes newline-delimited lifecycle events to stderr. `psql
+--json` changes wrapper errors only; the interactive client still owns its
+output.
+
+Automation can rely on these exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Command completed successfully |
+| `1` | Popgres failed |
+| `10` | `up` found the instance already running |
+| `11` | A requested port is already in use |
+| `12` | `status` found no running instance |
+
+Coded exits start at 10 so they can never be confused with a usage error,
+which exits `2`. `run` returns the child command's exit code instead,
+including `128 + signal` when the child is terminated by a signal.
 
 ## Configuration
 
