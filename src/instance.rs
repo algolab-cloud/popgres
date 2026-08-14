@@ -1,16 +1,18 @@
 //! Starting, adopting and stopping the Postgres process itself.
 
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use postgresql_embedded::{PostgreSQL, Settings, SettingsBuilder, VersionReq};
+use postgresql_embedded::{PostgreSQL, Settings, SettingsBuilder, Version, VersionReq};
 
 use crate::project::Project;
 use crate::seed;
-use crate::state::InstanceState;
+use crate::state::{wipe_state_dir, InstanceState, StateLock};
 use crate::ENV_VAR;
 
 const DEFAULT_DATABASE: &str = "db";
@@ -22,12 +24,93 @@ pub struct Started {
     pub already_running: bool,
 }
 
-pub fn port_is_open(port: u16) -> bool {
-    TcpStream::connect_timeout(
-        &(std::net::Ipv4Addr::LOCALHOST, port).into(),
-        Duration::from_millis(300),
-    )
-    .is_ok()
+/// Confirm that the recorded data directory owns a live PostgreSQL process on
+/// the recorded port. A bare TCP connection is insufficient because another
+/// service may have claimed the port after a crash.
+pub fn instance_is_running(state: &InstanceState) -> Result<bool> {
+    let data_dir = Path::new(&state.data_dir);
+    let pid_file = data_dir.join("postmaster.pid");
+    let raw = match std::fs::read_to_string(&pid_file) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", pid_file.display()))
+        }
+    };
+    if !postmaster_identity_matches(state, &raw) {
+        return Ok(false);
+    }
+
+    let pg_ctl = installation_binary(state, "pg_ctl");
+    if !pg_ctl.exists() {
+        return Ok(false);
+    }
+    let status = std::process::Command::new(&pg_ctl)
+        .args(["status", "-D"])
+        .arg(data_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to run {}", pg_ctl.display()))?;
+
+    Ok(status.success() && postgres_handshake(&state.host, state.port))
+}
+
+fn postmaster_identity_matches(state: &InstanceState, pid_file: &str) -> bool {
+    let lines: Vec<_> = pid_file.lines().collect();
+    let Some(pid) = lines.first().and_then(|line| line.parse::<u32>().ok()) else {
+        return false;
+    };
+    if pid == 0 || state.postmaster_pid.is_some_and(|expected| expected != pid) {
+        return false;
+    }
+    let Some(data_dir) = lines.get(1) else {
+        return false;
+    };
+    if !same_path(Path::new(data_dir), Path::new(&state.data_dir)) {
+        return false;
+    }
+    lines
+        .get(3)
+        .and_then(|line| line.parse::<u16>().ok())
+        .is_some_and(|port| port == state.port)
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+/// Speak just enough of the PostgreSQL wire protocol to distinguish Postgres
+/// from an arbitrary process listening on the same TCP port.
+fn postgres_handshake(host: &str, port: u16) -> bool {
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    for address in addresses {
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+            continue;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .ok();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(300)))
+            .ok();
+        // SSLRequest: int32 length (8), int32 request code (80877103), network order.
+        if stream.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).is_err() {
+            continue;
+        }
+        let mut response = [0_u8; 1];
+        if stream.read_exact(&mut response).is_ok() && matches!(response[0], b'N' | b'S') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Settings shared by every instance of a given project, before we know
@@ -64,6 +147,7 @@ pub async fn start(
     pg: Option<String>,
 ) -> Result<Started> {
     let state_dir = project.state_dir.as_path();
+    let _lock = StateLock::acquire(state_dir)?;
     let keep = keep || project.config.keep.unwrap_or(false);
     let port = port.or_else(|| project.config.fixed_port());
     let pg = pg.or_else(|| project.config.pg_version.clone());
@@ -72,7 +156,7 @@ pub async fn start(
 
     // Already running? Be idempotent.
     if let Some(existing) = previous.as_ref() {
-        if port_is_open(existing.port) {
+        if instance_is_running(existing)? {
             project.write_env_file(&existing.url())?;
             return Ok(Started {
                 state: existing.clone(),
@@ -117,6 +201,10 @@ pub async fn start(
             .password(previous.password.clone())
             .installation_dir(PathBuf::from(&previous.installation_dir))
             .version(VersionReq::from_str(&previous.pg_version).unwrap_or_default());
+
+        if let Some(requested) = pg.as_deref() {
+            ensure_resume_version_matches(&data_dir, previous, requested)?;
+        }
     }
 
     // Only a fresh instance can take a configured password: an existing role
@@ -175,6 +263,7 @@ pub async fn start(
     }
 
     let settings = postgresql.settings();
+    let postmaster_pid = read_postmaster_pid(&data_dir)?;
     let state = InstanceState {
         project_dir: project.root.display().to_string(),
         data_dir: settings.data_dir.display().to_string(),
@@ -197,6 +286,7 @@ pub async fn start(
             || settings.version.to_string(),
             |name| name.to_string_lossy().into_owned(),
         ),
+        postmaster_pid: Some(postmaster_pid),
         keep,
     };
     state.save(state_dir)?;
@@ -223,18 +313,72 @@ pub async fn start(
 /// Stop the instance and, unless we're keeping it, wipe everything it left behind.
 pub async fn stop(project: &Project, state: &InstanceState, keep: bool) -> Result<()> {
     let state_dir = project.state_dir.as_path();
-    if port_is_open(state.port) {
-        PostgreSQL::new(settings_for(state_dir, state))
+    let _lock = StateLock::acquire(state_dir)?;
+    let Some(current) = InstanceState::load(state_dir)? else {
+        return project.clear_env_file();
+    };
+    if current != *state {
+        bail!("the popgres instance changed while waiting for the state lock — retry the command");
+    }
+    if instance_is_running(&current)? {
+        PostgreSQL::new(settings_for(state_dir, &current))
             .stop()
             .await
             .context("failed to stop Postgres")?;
     }
     if !keep {
-        std::fs::remove_dir_all(state_dir)
+        wipe_state_dir(state_dir)
             .with_context(|| format!("failed to wipe {}", state_dir.display()))?;
     }
     // The URL is dead either way: a kept instance comes back on a new port.
     project.clear_env_file()
+}
+
+fn read_postmaster_pid(data_dir: &Path) -> Result<u32> {
+    let path = data_dir.join("postmaster.pid");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    raw.lines()
+        .next()
+        .and_then(|line| line.parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .with_context(|| format!("invalid postmaster PID in {}", path.display()))
+}
+
+fn ensure_resume_version_matches(
+    data_dir: &Path,
+    previous: &InstanceState,
+    requested: &str,
+) -> Result<()> {
+    let version_file = data_dir.join("PG_VERSION");
+    let data_major = std::fs::read_to_string(&version_file)
+        .with_context(|| format!("cannot read {}", version_file.display()))?;
+    let data_major = data_major.trim();
+    let actual =
+        Version::parse(previous.pg_version.trim_start_matches('=')).with_context(|| {
+            format!(
+                "invalid Postgres version in saved state: {}",
+                previous.pg_version
+            )
+        })?;
+    if actual.major.to_string() != data_major {
+        bail!(
+            "saved Postgres version {} does not match data directory version {}.x — run `popgres reset`",
+            previous.pg_version,
+            data_major
+        );
+    }
+    let requirement = VersionReq::from_str(requested)
+        .with_context(|| format!("invalid Postgres version requirement: {requested}"))?;
+    if !requirement.matches(&actual) {
+        bail!(
+            "data dir is PostgreSQL {}.x, but `{}` was requested — run `popgres reset` or pass `--pg {}`",
+            data_major,
+            requested,
+            data_major
+        );
+    }
+    Ok(())
 }
 
 /// Replace the freshly-initdb'd `pg_hba.conf` with one that asks for no password.
@@ -274,9 +418,7 @@ pub fn instance_env(state: &InstanceState) -> Vec<(&'static str, String)> {
 
 /// The `psql` shipped alongside the cached server binaries.
 pub fn psql_binary(state: &InstanceState) -> Result<PathBuf> {
-    let binary = PathBuf::from(&state.installation_dir)
-        .join("bin")
-        .join(if cfg!(windows) { "psql.exe" } else { "psql" });
+    let binary = installation_binary(state, "psql");
     if !binary.exists() {
         bail!(
             "psql is missing from {} — the cached PostgreSQL install looks incomplete",
@@ -284,6 +426,16 @@ pub fn psql_binary(state: &InstanceState) -> Result<PathBuf> {
         );
     }
     Ok(binary)
+}
+
+fn installation_binary(state: &InstanceState, name: &str) -> PathBuf {
+    PathBuf::from(&state.installation_dir)
+        .join("bin")
+        .join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        })
 }
 
 #[cfg(test)]
@@ -301,14 +453,80 @@ mod tests {
             password: String::new(),
             database: "db".to_string(),
             pg_version: "18.4.0".to_string(),
+            postmaster_pid: Some(12345),
             keep: false,
         }
     }
 
     #[test]
-    fn a_port_nothing_is_listening_on_reads_as_closed() {
-        // Port 1 is privileged and unused; nothing local should answer there.
-        assert!(!port_is_open(1));
+    fn postmaster_identity_requires_the_recorded_data_dir_and_port() {
+        let state = sample();
+        let valid = format!(
+            "12345\n{}\n1723456789\n{}\n/tmp\n127.0.0.1\n",
+            state.data_dir, state.port
+        );
+        assert!(postmaster_identity_matches(&state, &valid));
+        let wrong_pid = InstanceState {
+            postmaster_pid: Some(54321),
+            ..state.clone()
+        };
+        assert!(!postmaster_identity_matches(&wrong_pid, &valid));
+        assert!(!postmaster_identity_matches(
+            &state,
+            &valid.replace(&state.port.to_string(), "54330")
+        ));
+        assert!(!postmaster_identity_matches(
+            &state,
+            &valid.replace(&state.data_dir, "/tmp/other/data")
+        ));
+    }
+
+    #[test]
+    fn postgres_handshake_rejects_an_arbitrary_tcp_service() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8];
+            stream.read_exact(&mut request).unwrap();
+            stream.write_all(b"X").unwrap();
+        });
+
+        assert!(!postgres_handshake(LOCALHOST, port));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn postgres_handshake_accepts_a_postgres_ssl_response() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(request, [0, 0, 0, 8, 4, 210, 22, 47]);
+            stream.write_all(b"N").unwrap();
+        });
+
+        assert!(postgres_handshake(LOCALHOST, port));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn resuming_rejects_a_different_postgres_major() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "18\n").unwrap();
+        let error = ensure_resume_version_matches(dir.path(), &sample(), "19").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("data dir is PostgreSQL 18.x"));
+        assert!(message.contains("--pg 18"));
+    }
+
+    #[test]
+    fn resuming_accepts_a_compatible_postgres_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PG_VERSION"), "18\n").unwrap();
+        ensure_resume_version_matches(dir.path(), &sample(), "18").unwrap();
     }
 
     #[test]

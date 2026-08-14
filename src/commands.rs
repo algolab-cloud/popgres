@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::instance::{self, instance_env, port_is_open, psql_binary, Started};
+use crate::instance::{self, instance_env, instance_is_running, psql_binary, Started};
 use crate::project::Project;
 use crate::state::InstanceState;
 
@@ -62,42 +62,69 @@ pub async fn run(
     }
 
     // The child owns stdout: everything popgres says here goes to stderr.
-    let mut child = tokio::process::Command::new(&cmd[0])
+    let child = tokio::process::Command::new(&cmd[0])
         .args(&cmd[1..])
         .envs(instance_env(&state))
-        .spawn()
-        .with_context(|| format!("failed to run `{}`", cmd.join(" ")))?;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let spawn_error =
+                anyhow::Error::new(error).context(format!("failed to run `{}`", cmd.join(" ")));
+            return match cleanup_after_run(&project, &state, already_running).await {
+                Ok(()) => Err(spawn_error),
+                Err(cleanup_error) => Err(spawn_error.context(format!(
+                    "also failed to clean up the database: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
 
-    let status = tokio::select! {
-        result = child.wait() => result.context("failed to wait for the child process")?,
+    let status: Result<_> = tokio::select! {
+        result = child.wait() => result.context("failed to wait for the child process"),
         () = shutdown_signal() => {
             // Ctrl-C reaches the whole foreground process group, so the child is
             // usually already on its way out — let it finish before insisting.
             match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
-                Ok(result) => result.context("failed to wait for the child process")?,
+                Ok(result) => result.context("failed to wait for the child process"),
                 Err(_) => {
                     eprintln!("popgres: command did not exit, killing it");
                     child.start_kill().ok();
-                    child.wait().await.context("failed to wait for the child process")?
+                    child.wait().await.context("failed to wait for the child process")
                 }
             }
         }
     };
 
-    // Teardown runs however the child exited. `state.keep` is the resolved
-    // answer, since `keep = true` can also come from popgres.toml.
+    let cleanup = cleanup_after_run(&project, &state, already_running).await;
+    match (status, cleanup) {
+        (Ok(status), Ok(())) => std::process::exit(status.code().unwrap_or(1)),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "also failed to clean up the database: {cleanup_error:#}"
+        ))),
+    }
+}
+
+/// Teardown runs however the child exited or whether it started at all.
+/// `state.keep` is the resolved answer because keep can also come from config.
+async fn cleanup_after_run(
+    project: &Project,
+    state: &InstanceState,
+    already_running: bool,
+) -> Result<()> {
     if already_running {
         eprintln!("popgres: leaving the instance that was already running");
     } else {
-        instance::stop(&project, &state, state.keep).await?;
+        instance::stop(project, state, state.keep).await?;
         if state.keep {
             eprintln!("popgres: stopped (data kept)");
         } else {
             eprintln!("popgres: stopped and wiped — poof!");
         }
     }
-
-    std::process::exit(status.code().unwrap_or(1));
+    Ok(())
 }
 
 /// Resolves when the user (or the OS) asks us to shut down.
@@ -192,7 +219,10 @@ pub async fn reset(json: bool) -> Result<()> {
 pub fn status(json: bool) -> Result<()> {
     let project = Project::discover()?;
     let state = project.state()?;
-    let running = state.as_ref().is_some_and(|s| port_is_open(s.port));
+    let running = match state.as_ref() {
+        Some(state) => instance_is_running(state)?,
+        None => false,
+    };
 
     if json {
         println!(

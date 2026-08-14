@@ -1,13 +1,47 @@
 //! Per-project instance state: where it lives and what's in it.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+const LOCK_FILE: &str = ".lock";
+
+/// An exclusive advisory lock for one project's state transitions.
+///
+/// The lock file remains in the state directory when the database is wiped so
+/// every process continues to lock the same inode. Dropping this value releases
+/// the lock.
+pub struct StateLock {
+    _file: File,
+}
+
+impl StateLock {
+    pub fn acquire(state_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("cannot create {}", state_dir.display()))?;
+        let path = state_dir.join(LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("cannot open state lock {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("cannot lock state directory {}", state_dir.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Everything we need to find, reconnect to, and tear down an instance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceState {
     pub project_dir: String,
     pub data_dir: String,
@@ -18,6 +52,9 @@ pub struct InstanceState {
     pub password: String,
     pub database: String,
     pub pg_version: String,
+    /// Postmaster PID captured at startup. Missing in state written by v0.1.0.
+    #[serde(default)]
+    pub postmaster_pid: Option<u32>,
     /// Persist data across stops (set by `up --keep` or config).
     pub keep: bool,
 }
@@ -42,8 +79,7 @@ impl InstanceState {
             .with_context(|| format!("cannot create {}", state_dir.display()))?;
         let path = state_dir.join("state.json");
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json).with_context(|| format!("cannot write {}", path.display()))?;
-        Ok(())
+        write_private(&path, &json).with_context(|| format!("cannot write {}", path.display()))
     }
 
     pub fn load(state_dir: &Path) -> Result<Option<Self>> {
@@ -57,6 +93,56 @@ impl InstanceState {
             .with_context(|| format!("corrupt state file {}", path.display()))?;
         Ok(Some(state))
     }
+}
+
+/// Remove all instance data while preserving the stable advisory lock file.
+pub fn wipe_state_dir(state_dir: &Path) -> Result<()> {
+    if !state_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(state_dir)
+        .with_context(|| format!("cannot read {}", state_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("cannot read {}", state_dir.display()))?;
+        if entry.file_name() == LOCK_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("cannot remove {}", path.display()))?;
+        } else {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("cannot remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Write a file that may contain credentials so only its owner can read it.
+pub(crate) fn write_private(path: &Path, contents: &str) -> Result<()> {
+    let mut file = private_open_options().open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(format!("{contents}\n").as_bytes())?;
+    Ok(())
+}
+
+fn private_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
 }
 
 /// Stable per-project state directory: ~/.local/share/popgres/<hash>/ (platform equivalent).
@@ -88,6 +174,7 @@ mod tests {
             password: "s3cr3t".to_string(),
             database: "db".to_string(),
             pg_version: "18.4.0".to_string(),
+            postmaster_pid: Some(12345),
             keep: false,
         }
     }
@@ -129,6 +216,58 @@ mod tests {
         assert!(nested.join("state.json").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn state_files_are_readable_only_by_their_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        sample().save(dir.path()).unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn state_lock_serializes_callers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = StateLock::acquire(dir.path()).unwrap();
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _second = StateLock::acquire(&path).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn wiping_state_preserves_only_the_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = StateLock::acquire(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("data/nested")).unwrap();
+        std::fs::write(dir.path().join("data/nested/file"), "data").unwrap();
+        std::fs::write(dir.path().join("state.json"), "state").unwrap();
+
+        wipe_state_dir(dir.path()).unwrap();
+
+        assert!(dir.path().join(LOCK_FILE).exists());
+        assert!(!dir.path().join("data").exists());
+        assert!(!dir.path().join("state.json").exists());
+        drop(lock);
+    }
+
     #[test]
     fn load_is_none_when_there_is_no_instance() {
         let dir = tempfile::tempdir().unwrap();
@@ -140,6 +279,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("state.json"), "{ not json").unwrap();
         assert!(InstanceState::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn state_from_v0_1_without_a_postmaster_pid_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("postmaster_pid");
+        std::fs::write(
+            dir.path().join("state.json"),
+            serde_json::to_string(&json).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = InstanceState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.postmaster_pid, None);
     }
 
     #[test]

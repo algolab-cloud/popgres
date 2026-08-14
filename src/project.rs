@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::config::{self, Config};
-use crate::instance::port_is_open;
-use crate::state::{project_state_dir, InstanceState};
+use crate::instance::instance_is_running;
+use crate::state::{project_state_dir, write_private, InstanceState};
 use crate::ENV_VAR;
 
 /// The project the current directory belongs to, its optional `popgres.toml`,
@@ -42,7 +42,7 @@ impl Project {
         let Some(state) = self.state()? else {
             bail!("no popgres instance found for this project — run `popgres up` first");
         };
-        if !port_is_open(state.port) {
+        if !instance_is_running(&state)? {
             bail!("instance is not running — run `popgres up`");
         }
         Ok(state)
@@ -100,26 +100,6 @@ fn env_file_lines_without_url(path: &Path) -> Result<Vec<String>> {
         .filter(|line| !line.trim_start().starts_with(&format!("{ENV_VAR}=")))
         .map(str::to_string)
         .collect())
-}
-
-/// Write a file only its owner can read — the URL in it may contain a password.
-fn write_private(path: &Path, contents: &str) -> Result<()> {
-    let body = format!("{contents}\n");
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(body.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, body)?;
-    Ok(())
 }
 
 #[cfg(test)]
