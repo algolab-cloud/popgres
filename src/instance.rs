@@ -145,6 +145,7 @@ pub async fn start(
     keep: bool,
     port: Option<u16>,
     pg: Option<String>,
+    quiet: bool,
 ) -> Result<Started> {
     let state_dir = project.state_dir.as_path();
     let _lock = StateLock::acquire(state_dir)?;
@@ -162,6 +163,15 @@ pub async fn start(
                 state: existing.clone(),
                 already_running: true,
             });
+        }
+    }
+
+    if let Some(port) = port {
+        if tcp_port_is_bound(port) {
+            return Err(crate::error::coded(
+                crate::error::PORT_BUSY,
+                format!("port {port} is already in use"),
+            ));
         }
     }
 
@@ -228,7 +238,7 @@ pub async fn start(
     }
 
     let mut postgresql = PostgreSQL::new(builder.build());
-    if !resuming {
+    if !resuming && !quiet {
         eprintln!(
             "popgres: initializing a fresh database (the first run of a Postgres version downloads it)..."
         );
@@ -246,10 +256,18 @@ pub async fn start(
         write_trust_hba(&data_dir)?;
     }
 
-    postgresql
-        .start()
-        .await
-        .context("failed to start Postgres")?;
+    if let Err(start_error) = postgresql.start().await {
+        if port.is_some_and(tcp_port_is_bound) {
+            return Err(crate::error::coded(
+                crate::error::PORT_BUSY,
+                format!(
+                    "port {} became busy while Postgres was starting",
+                    port.unwrap()
+                ),
+            ));
+        }
+        return Err(start_error).context("failed to start Postgres");
+    }
 
     if !postgresql
         .database_exists(&database)
@@ -299,7 +317,7 @@ pub async fn start(
     // fresh database — but never over data we just resumed.
     if !resuming {
         if let Some(recipe) = project.config.seed.as_deref() {
-            seed::run(project, &state, recipe)?;
+            seed::run(project, &state, recipe, quiet)?;
         }
     }
     project.write_env_file(&state.url())?;
@@ -438,6 +456,14 @@ fn installation_binary(state: &InstanceState, name: &str) -> PathBuf {
         })
 }
 
+fn tcp_port_is_bound(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &(std::net::Ipv4Addr::LOCALHOST, port).into(),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +536,12 @@ mod tests {
 
         assert!(postgres_handshake(LOCALHOST, port));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_listening_fixed_port_is_detected_as_busy() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert!(tcp_port_is_bound(listener.local_addr().unwrap().port()));
     }
 
     #[test]

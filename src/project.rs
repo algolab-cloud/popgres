@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::config::{self, Config};
 use crate::instance::instance_is_running;
@@ -40,10 +40,16 @@ impl Project {
     /// The state of a running instance, or a clear error explaining there isn't one.
     pub fn running_instance(&self) -> Result<InstanceState> {
         let Some(state) = self.state()? else {
-            bail!("no popgres instance found for this project — run `popgres up` first");
+            return Err(crate::error::coded(
+                crate::error::NOT_RUNNING,
+                "no popgres instance found for this project — run `popgres up` first",
+            ));
         };
         if !instance_is_running(&state)? {
-            bail!("instance is not running — run `popgres up`");
+            return Err(crate::error::coded(
+                crate::error::NOT_RUNNING,
+                "instance is not running — run `popgres up`",
+            ));
         }
         Ok(state)
     }

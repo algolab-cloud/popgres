@@ -8,14 +8,16 @@ use crate::state::InstanceState;
 
 /// Run the configured `seed`: a `.sql` file goes through psql, anything else
 /// runs as a shell command with `DATABASE_URL` set.
-pub fn run(project: &Project, state: &InstanceState, recipe: &str) -> Result<()> {
+pub fn run(project: &Project, state: &InstanceState, recipe: &str, quiet: bool) -> Result<()> {
     let path = project.root.join(recipe);
     let is_sql_file = path.is_file()
         && path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"));
 
-    eprintln!("popgres: seeding from {recipe}");
+    if !quiet {
+        eprintln!("popgres: seeding from {recipe}");
+    }
     let status = if is_sql_file {
         std::process::Command::new(psql_binary(state)?)
             .arg(state.url())
