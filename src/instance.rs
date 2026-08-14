@@ -124,13 +124,25 @@ pub enum Entry {
     Unreadable { state_dir: PathBuf, reason: String },
 }
 
+/// Every state directory a machine-wide command should visit: the global
+/// state root plus every registered local `.popgres/`.
+fn discoverable_state_dirs() -> Result<Vec<PathBuf>> {
+    let mut dirs = crate::state::all_state_dirs()?;
+    dirs.extend(crate::registry::local_state_dirs()?);
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
+}
+
 /// Every instance popgres knows about, across all projects.
 ///
-/// Strictly read-only: it takes no lock and creates nothing, so surveying the
-/// machine can never disturb a project mid-start or leave files behind.
+/// Read-only towards instances: it takes no project lock and touches no
+/// project state, so surveying can never disturb a project mid-start. (The
+/// registry of local projects is popgres's own bookkeeping and prunes as it
+/// is read.)
 pub fn list() -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    for state_dir in crate::state::all_state_dirs()? {
+    for state_dir in discoverable_state_dirs()? {
         match InstanceState::load(&state_dir) {
             Ok(Some(state)) => {
                 let liveness = probe(&state);
@@ -246,6 +258,13 @@ pub async fn start(
     json: bool,
 ) -> Result<Started> {
     let _lock = StateLock::acquire(&project.state_dir, json)?;
+    if project.local {
+        // A `.popgres/` inside the project must ignore itself and read as a
+        // cache to backup tools, and machine-wide commands find it through
+        // the registry — the global state root no longer sees it.
+        crate::state::ensure_local_markers(&project.state_dir)?;
+        crate::registry::register(&project.root)?;
+    }
     start_locked(project, keep, port, pg, ttl, json).await
 }
 
@@ -549,7 +568,7 @@ pub enum Reaped {
 /// confirmed is reported rather than wiped, exactly as `stop` treats it.
 pub async fn gc(dry_run: bool) -> Result<Vec<(PathBuf, Reaped)>> {
     let mut swept = Vec::new();
-    for state_dir in crate::state::all_state_dirs()? {
+    for state_dir in discoverable_state_dirs()? {
         if let Some(outcome) = reap_state_dir(&state_dir, dry_run).await {
             swept.push((state_dir, outcome));
         }

@@ -127,7 +127,14 @@ port = 0
 keep = false
 seed = "./db/seed.sql"
 env_file = ".env.local"
+location = "local"
 ```
+
+Instances live in `.popgres/` inside the project by default; the directory
+ignores itself, so never add it to the repository's `.gitignore` or commit
+it. Deleting `.popgres/` disposes of the instance data. Set
+`location = "global"` for projects inside synced folders (Dropbox, iCloud,
+OneDrive) — syncing a live database directory risks corruption.
 
 Use `port = 0` for collision-free allocation. Omit `password` for the default
 passwordless loopback-only instance. A `seed` SQL file or shell command runs

@@ -108,6 +108,34 @@ impl StateLock {
     }
 }
 
+/// Make a local `.popgres/` a good citizen of the project tree.
+///
+/// A `.gitignore` containing `*` keeps the whole directory out of version
+/// control without touching the repository's own ignore file, and a
+/// `CACHEDIR.TAG` tells backup and sync tools the contents are disposable.
+/// Both survive wipes and are only written when missing, so a user who
+/// deliberately edits them is left alone.
+pub fn ensure_local_markers(state_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("cannot create {}", state_dir.display()))?;
+    let gitignore = state_dir.join(".gitignore");
+    if !gitignore.exists() {
+        std::fs::write(&gitignore, "*\n")
+            .with_context(|| format!("cannot write {}", gitignore.display()))?;
+    }
+    let cachedir_tag = state_dir.join("CACHEDIR.TAG");
+    if !cachedir_tag.exists() {
+        std::fs::write(
+            &cachedir_tag,
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This directory holds a disposable popgres PostgreSQL instance.\n\
+             # See https://bford.info/cachedir/\n",
+        )
+        .with_context(|| format!("cannot write {}", cachedir_tag.display()))?;
+    }
+    Ok(())
+}
+
 /// Seconds since the Unix epoch — how deadlines are recorded, so they survive
 /// process exit, reboots, and clock-independent monotonic sources.
 pub fn now_unix() -> u64 {
@@ -181,7 +209,13 @@ impl InstanceState {
     }
 }
 
-/// Remove all instance data while preserving the stable advisory lock file.
+/// Files that survive a wipe: the stable lock inode, plus the two markers
+/// that make a local `.popgres/` behave well in a repository (self-ignoring)
+/// and under backup tools (cache tag).
+const WIPE_KEEPS: [&str; 3] = [LOCK_FILE, ".gitignore", "CACHEDIR.TAG"];
+
+/// Remove all instance data while preserving the stable advisory lock file
+/// and the local-directory markers.
 pub fn wipe_state_dir(state_dir: &Path) -> Result<()> {
     if !state_dir.exists() {
         return Ok(());
@@ -190,7 +224,7 @@ pub fn wipe_state_dir(state_dir: &Path) -> Result<()> {
         .with_context(|| format!("cannot read {}", state_dir.display()))?
     {
         let entry = entry.with_context(|| format!("cannot read {}", state_dir.display()))?;
-        if entry.file_name() == LOCK_FILE {
+        if WIPE_KEEPS.iter().any(|keep| entry.file_name() == *keep) {
             continue;
         }
         let path = entry.path();
@@ -383,6 +417,38 @@ mod tests {
         assert!(!dir.path().join("data").exists());
         assert!(!dir.path().join("state.json").exists());
         drop(lock);
+    }
+
+    #[test]
+    fn local_markers_are_written_once_and_survive_a_wipe() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_local_markers(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        assert!(std::fs::read_to_string(dir.path().join("CACHEDIR.TAG"))
+            .unwrap()
+            .starts_with("Signature: 8a477f597d28d172789f06886806bc55"));
+
+        // A user's deliberate edit is left alone.
+        std::fs::write(dir.path().join(".gitignore"), "*\n!keep-me\n").unwrap();
+        ensure_local_markers(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            "*\n!keep-me\n"
+        );
+
+        // Wiping removes the instance but keeps the markers and the lock.
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("state.json"), "{}").unwrap();
+        drop(StateLock::acquire(dir.path(), false).unwrap());
+        wipe_state_dir(dir.path()).unwrap();
+        assert!(!dir.path().join("data").exists());
+        assert!(!dir.path().join("state.json").exists());
+        assert!(dir.path().join(".gitignore").exists());
+        assert!(dir.path().join("CACHEDIR.TAG").exists());
+        assert!(dir.path().join(".lock").exists());
     }
 
     #[test]

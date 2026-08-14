@@ -123,7 +123,21 @@ keep = false             # wipe data when stopped
 ttl = "30m"              # dispose of the instance after this long
 seed = "./db/seed.sql"   # run after fresh initialization
 env_file = ".env.local"  # write DATABASE_URL while running
+location = "local"       # or "global": keep the project tree free of db files
 ```
+
+## Where the database lives
+
+By default the instance lives in `.popgres/` inside the project, like `.git`
+or `node_modules`: delete the project and its database is gone with it. The
+directory ignores itself (its own `.gitignore`) and carries a `CACHEDIR.TAG`
+so backup tools skip it — nothing to add to your repository.
+
+Set `location = "global"` to keep the instance in the per-user data directory
+instead. Do this when the project lives in a synced folder (Dropbox, iCloud,
+OneDrive): syncing a live database directory risks corruption. Projects with
+an existing global instance keep using it until it is wiped; the next fresh
+start is local.
 
 The default instance is passwordless and listens only on loopback. Set
 `password` in `popgres.toml` when authentication is required. Keep configured

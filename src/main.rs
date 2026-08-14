@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod instance;
 mod project;
+mod registry;
 mod seed;
 mod state;
 

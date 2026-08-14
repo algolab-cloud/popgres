@@ -4,6 +4,25 @@ All notable changes to popgres are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the version
 is below 1.0, minor releases may change behavior.
 
+## Unreleased
+
+### Changed
+
+- **Instances now live in `.popgres/` inside the project by default**, like
+  `.git` or `node_modules`: delete the project and its database goes with it.
+  The directory ignores itself and carries a `CACHEDIR.TAG` so version
+  control and backup tools skip it. Set `location = "global"` in
+  `popgres.toml` for the old behavior — recommended for projects in synced
+  folders (Dropbox, iCloud), where syncing a live data directory risks
+  corruption. A project with an existing global instance keeps using it until
+  that instance is wiped; the next fresh start is local.
+
+### Added
+
+- A small global registry lets `list` and `gc` find local instances across
+  the machine; entries whose project or instance has been deleted are pruned
+  automatically.
+
 ## 0.3.0
 
 ### Added
