@@ -174,15 +174,24 @@ pub struct InstanceState {
 impl InstanceState {
     /// The connection string. An instance without a password (the default) gets
     /// a URL without one, rather than an empty `:@`.
+    /// Each component is percent-encoded, so a password like `p@ss/word` can
+    /// never be misread as part of the host or path.
     pub fn url(&self) -> String {
         let credentials = if self.password.is_empty() {
-            self.username.clone()
+            percent_encode(&self.username)
         } else {
-            format!("{}:{}", self.username, self.password)
+            format!(
+                "{}:{}",
+                percent_encode(&self.username),
+                percent_encode(&self.password)
+            )
         };
         format!(
             "postgresql://{}@{}:{}/{}",
-            credentials, self.host, self.port, self.database
+            credentials,
+            self.host,
+            self.port,
+            percent_encode(&self.database)
         )
     }
 
@@ -204,7 +213,12 @@ impl InstanceState {
             .with_context(|| format!("cannot create {}", state_dir.display()))?;
         let path = state_dir.join("state.json");
         let json = serde_json::to_string_pretty(self)?;
-        write_private(&path, &json).with_context(|| format!("cannot write {}", path.display()))
+        // Write-then-rename, so a crash mid-write can never leave a torn state
+        // file — that would strand the instance behind "corrupt state". The
+        // lock lives in its own file, so swapping this inode is safe.
+        let temp = state_dir.join("state.json.tmp");
+        write_private(&temp, &json).with_context(|| format!("cannot write {}", temp.display()))?;
+        std::fs::rename(&temp, &path).with_context(|| format!("cannot write {}", path.display()))
     }
 
     pub fn load(state_dir: &Path) -> Result<Option<Self>> {
@@ -316,6 +330,20 @@ fn state_dirs_in(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+/// Percent-encode everything outside RFC 3986's unreserved set, which is
+/// what libpq and every other URL consumer decode.
+fn percent_encode(raw: &str) -> String {
+    raw.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -357,6 +385,28 @@ mod tests {
             ..sample()
         };
         assert_eq!(state.url(), "postgresql://postgres@127.0.0.1:54329/db");
+    }
+
+    #[test]
+    fn url_components_with_reserved_characters_are_percent_encoded() {
+        let state = InstanceState {
+            password: "p@ss:w/rd?#%".to_string(),
+            database: "my app".to_string(),
+            ..sample()
+        };
+        assert_eq!(
+            state.url(),
+            "postgresql://postgres:p%40ss%3Aw%2Frd%3F%23%25@127.0.0.1:54329/my%20app"
+        );
+    }
+
+    #[test]
+    fn saving_leaves_no_temporary_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        sample().save(dir.path()).unwrap();
+        sample().save(dir.path()).unwrap();
+        assert!(dir.path().join("state.json").is_file());
+        assert!(!dir.path().join("state.json.tmp").exists());
     }
 
     #[test]

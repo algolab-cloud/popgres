@@ -186,15 +186,24 @@ pub fn testdb(name: Option<String>, clean: bool, json: bool) -> Result<()> {
 /// `<database>_t_<random>` — recognizable, so `--clean` can find every
 /// generated clone without bookkeeping. Named clones are the caller's own.
 fn generated_clone_name(database: &str) -> String {
-    let base: String = database.chars().take(50).collect();
-    format!("{base}_t_{:08x}", rand::random::<u32>())
+    format!("{}_t_{:08x}", clone_base(database), rand::random::<u32>())
+}
+
+/// The database name, cut to at most 50 bytes on a character boundary.
+/// PostgreSQL's 63-*byte* identifier limit silently truncates anything
+/// longer, which would leave the printed URL pointing at no database.
+fn clone_base(database: &str) -> &str {
+    let mut end = database.len().min(50);
+    while !database.is_char_boundary(end) {
+        end -= 1;
+    }
+    &database[..end]
 }
 
 /// The SQL LIKE pattern matching generated clone names, quotes and
 /// wildcards escaped.
 fn generated_clone_pattern(database: &str) -> String {
-    let base: String = database.chars().take(50).collect();
-    let escaped = base
+    let escaped = clone_base(database)
         .replace('\'', "''")
         .replace('\\', "\\\\")
         .replace('_', "\\_")
@@ -499,10 +508,6 @@ pub async fn reset(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Dispose of every instance past its TTL, in this project and any other.
-///
-/// This is the only command that touches instances outside the current
-/// project, and it never destroys anything that has not expired.
 /// Survey every instance on this machine — the read-only counterpart to `gc`.
 ///
 /// Connection URLs are deliberately omitted: this walks every project, and a
@@ -641,6 +646,10 @@ fn ttl_label(expires_at: Option<u64>, now: u64) -> String {
     }
 }
 
+/// Dispose of every instance past its TTL, in this project and any other.
+///
+/// This is the only command that touches instances outside the current
+/// project, and it never destroys anything that has not expired.
 pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
     let (swept, evicted_variants) = instance::gc(dry_run).await?;
     let mut reaped = Vec::new();
@@ -862,6 +871,10 @@ mod tests {
         let name = generated_clone_name(&"x".repeat(60));
         assert!(name.len() <= 63);
         assert!(validate_database_name(&name).is_ok());
+        // Multi-byte names are measured in bytes, as PostgreSQL does.
+        let name = generated_clone_name(&"é".repeat(40));
+        assert!(name.len() <= 63, "{name}");
+        assert!(name.starts_with(&"é".repeat(25)));
     }
 
     #[test]

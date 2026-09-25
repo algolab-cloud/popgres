@@ -141,9 +141,20 @@ fn env_file_lines_without_url(path: &Path) -> Result<Vec<String>> {
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     Ok(raw
         .lines()
-        .filter(|line| !line.trim_start().starts_with(&format!("{ENV_VAR}=")))
+        .filter(|line| !sets_url(line))
         .map(str::to_string)
         .collect())
+}
+
+/// `DATABASE_URL=…`, including the shell-style `export DATABASE_URL=…` that
+/// dotenv loaders also accept.
+fn sets_url(line: &str) -> bool {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("export")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map_or(line, str::trim_start);
+    line.starts_with(&format!("{ENV_VAR}="))
 }
 
 #[cfg(test)]
@@ -214,10 +225,14 @@ mod tests {
     fn writing_the_url_leaves_other_variables_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env.local");
-        std::fs::write(&path, "API_KEY=abc\nDATABASE_URL=stale\nDEBUG=1\n").unwrap();
+        std::fs::write(
+            &path,
+            "API_KEY=abc\nDATABASE_URL=stale\nexport DATABASE_URL=stale\nDEBUG=1\nexportDATABASE_URL=x\n",
+        )
+        .unwrap();
 
         let kept = env_file_lines_without_url(&path).unwrap();
-        assert_eq!(kept, ["API_KEY=abc", "DEBUG=1"]);
+        assert_eq!(kept, ["API_KEY=abc", "DEBUG=1", "exportDATABASE_URL=x"]);
     }
 
     #[test]
