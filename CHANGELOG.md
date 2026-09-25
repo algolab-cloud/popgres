@@ -4,6 +4,29 @@ All notable changes to popgres are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the version
 is below 1.0, minor releases may change behavior.
 
+## 0.4.1
+
+### Fixed
+
+- **A failed first start no longer strands the project.** Any failure after
+  `initdb` — an unknown extension, a busy port, a failed download — left a
+  data directory without a state file, and every later `up` refused it until
+  it was deleted by hand. A failed fresh start now removes what it created.
+- **Passwords with URL-reserved characters work.** `password = "p@ss/word"`
+  produced a malformed `DATABASE_URL` and failed the start; user, password
+  and database are now percent-encoded.
+- `state.json` is written atomically, so a crash mid-write cannot leave it
+  corrupt.
+- `popgres reset` of a stopped instance no longer insists on its old port,
+  and a full reset keeps the instance's TTL deadline, as the in-place reset
+  already did.
+- `popgres gc` can no longer evict an extension variant that a concurrent
+  start has just picked up.
+- A `seed` naming a missing `.sql` file reports the missing file instead of a
+  shell "not found"; `export DATABASE_URL=…` lines in `env_file` are replaced
+  rather than duplicated; generated `testdb` names respect PostgreSQL's
+  63-byte limit for non-ASCII database names.
+
 ## 0.4.0
 
 ### Changed

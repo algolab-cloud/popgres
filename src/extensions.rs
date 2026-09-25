@@ -325,6 +325,14 @@ pub async fn ensure_variant(
         }
         if let Ok(manifest) = Manifest::read(&path) {
             if manifest.satisfies(&pg_version, specs) {
+                // Until this instance's state is saved nothing references the
+                // variant, so mark it as just used: eviction spares anything
+                // touched within the last hour.
+                std::fs::File::options()
+                    .write(true)
+                    .open(path.join(MANIFEST_FILE))
+                    .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+                    .ok();
                 return Ok(path);
             }
         }
@@ -509,11 +517,18 @@ fn evict_in(
         if !path.is_dir() {
             continue;
         }
-        let age = std::fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |mtime| now.saturating_sub(mtime.as_secs()));
+        // The newer of the folder and its manifest: reuse touches the manifest.
+        let age = [path.clone(), path.join(MANIFEST_FILE)]
+            .iter()
+            .filter_map(|path| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            })
+            .filter_map(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|mtime| now.saturating_sub(mtime.as_secs()))
+            .min()
+            .unwrap_or(0);
         if is_temp(&path) {
             // A crashed build's leftovers; give a live builder a wide berth.
             if age > 24 * 3600 && !dry_run {
@@ -857,5 +872,25 @@ mod tests {
         let evicted = super::evict_in(root.path(), &[], false, old).unwrap();
         assert_eq!(evicted, ["16.14.0+vector@0.8.0"]);
         assert!(!variant.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recently_reused_variant_survives_eviction() {
+        // An old variant a start just picked up is referenced by no state
+        // yet; its freshly touched manifest is what keeps `gc` off it.
+        let root = tempfile::tempdir().unwrap();
+        let variant = root.path().join("16.14.0+vector@0.8.0");
+        std::fs::create_dir_all(&variant).unwrap();
+        std::fs::write(variant.join(MANIFEST_FILE), "{}").unwrap();
+        let long_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(EVICT_MIN_AGE_SECS * 2);
+        std::fs::File::open(&variant)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let evicted = super::evict_in(root.path(), &[], true, crate::state::now_unix()).unwrap();
+        assert!(evicted.is_empty(), "{evicted:?}");
     }
 }

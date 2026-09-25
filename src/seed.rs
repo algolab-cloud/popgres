@@ -14,6 +14,11 @@ pub fn run(project: &Project, state: &InstanceState, recipe: &str, json: bool) -
         && path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"));
+    // A lone `*.sql` word that isn't a file is a mistyped path, not a shell
+    // command — say so instead of letting `sh` report "not found".
+    if !is_sql_file && looks_like_sql_path(recipe) {
+        bail!("seed file {} does not exist", path.display());
+    }
 
     crate::commands::emit_event(
         json,
@@ -58,4 +63,25 @@ pub fn run(project: &Project, state: &InstanceState, recipe: &str, json: bool) -
         bail!("seed `{recipe}` failed ({status}) — the database is up but not seeded");
     }
     Ok(())
+}
+
+fn looks_like_sql_path(recipe: &str) -> bool {
+    !recipe.contains(char::is_whitespace)
+        && std::path::Path::new(recipe)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_sql_path;
+
+    #[test]
+    fn a_bare_sql_path_is_told_apart_from_a_command() {
+        assert!(looks_like_sql_path("db/seed.sql"));
+        assert!(looks_like_sql_path("SEED.SQL"));
+        // A command that merely mentions a .sql file is still a command.
+        assert!(!looks_like_sql_path("psql -f db/seed.sql"));
+        assert!(!looks_like_sql_path("npm run seed"));
+    }
 }

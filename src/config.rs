@@ -93,11 +93,6 @@ pub fn parse_ttl(raw: &str) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(seconds))
 }
 
-/// Find the project this directory belongs to: the nearest ancestor holding a
-/// `popgres.toml`, else the nearest git root, else the directory itself.
-///
-/// Keying off the project root rather than the current directory means `popgres
-/// up` in the repo root and `popgres url` in a subdirectory find the same instance.
 /// The config of a known project root, without walking ancestors.
 pub fn at(root: &Path) -> Result<Config> {
     let config_file = root.join(CONFIG_FILE);
@@ -108,6 +103,11 @@ pub fn at(root: &Path) -> Result<Config> {
     }
 }
 
+/// Find the project this directory belongs to: the nearest ancestor holding a
+/// `popgres.toml`, else the nearest git root, else the directory itself.
+///
+/// Keying off the project root rather than the current directory means `popgres
+/// up` in the repo root and `popgres url` in a subdirectory find the same instance.
 pub fn discover(start: &Path) -> Result<(PathBuf, Config)> {
     for dir in start.ancestors() {
         let config_file = dir.join(CONFIG_FILE);

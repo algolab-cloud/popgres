@@ -308,7 +308,8 @@ pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Resu
         &current.pg_version,
         &extension_specs,
     );
-    if extensions_unchanged && matches!(probe(&current), Liveness::Running) {
+    let running = matches!(probe(&current), Liveness::Running);
+    if extensions_unchanged && running {
         let managed = psql_rows(
             &current,
             MAINTENANCE_DB,
@@ -336,15 +337,25 @@ pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Resu
     }
 
     stop_locked(project, state, false).await?;
-    start_locked(
+    // Only a live URL is worth keeping stable: a stopped instance's old port
+    // may belong to someone else by now, and a kept instance comes back on a
+    // new port anyway.
+    let mut started = start_locked(
         project,
         state.keep,
-        Some(state.port),
+        running.then_some(state.port),
         Some(state.pg_version.clone()),
         None,
         json,
     )
-    .await
+    .await?;
+    // Reset replaces the data, not the instance's lifetime — the same
+    // deadline the in-place path above keeps.
+    if started.state.expires_at != current.expires_at {
+        started.state.expires_at = current.expires_at;
+        started.state.save(&project.state_dir)?;
+    }
+    Ok(started)
 }
 
 /// Run one SQL statement through the instance's own `psql`, against a chosen
@@ -545,7 +556,6 @@ async fn start_locked(
         builder = builder.port(port);
     }
 
-    let mut postgresql = PostgreSQL::new(builder.build());
     if !resuming {
         emit_event(
             json,
@@ -553,124 +563,156 @@ async fn start_locked(
             "popgres: initializing a fresh database (the first run of a Postgres version downloads it)...",
         );
     }
-    postgresql
-        .setup()
-        .await
-        .context("failed to set up Postgres")?;
-
-    // `setup` resolves the requirement to a concrete install, and the
-    // directory it picked is named for the version we actually got —
-    // `settings.version` may still be the bare requirement (`*`). Read it
-    // now: a variant swap below renames the directory to the variant key,
-    // which must never leak into the recorded version.
-    let resolved_pg_version = postgresql
-        .settings()
-        .installation_dir
-        .file_name()
-        .map_or_else(
-            || postgresql.settings().version.to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-
-    let extension_specs = crate::extensions::specs(&project.config)?;
-    // Contrib extensions ship inside the install itself — verify they exist
-    // for this version now, while the error can still explain the options.
-    if !resuming {
-        crate::extensions::ensure_contrib_available(
-            &postgresql.settings().installation_dir,
-            &extension_specs,
-        )?;
-    }
-
-    // Packaged extensions never touch the pristine base install: a fresh
-    // start with any configured runs from a variant — a shared, immutable
-    // clone of the base with the extensions installed. Contrib-only configs
-    // skip all of this and run straight off the base. (A resume already
-    // points at its variant through the saved installation_dir.)
-    let packaged_specs = crate::extensions::packaged(&extension_specs);
-    if !resuming && !packaged_specs.is_empty() {
-        let variant =
-            crate::extensions::ensure_variant(postgresql.settings(), &packaged_specs, json).await?;
-        let mut settings = postgresql.settings().clone();
-        settings.installation_dir = variant;
-        // Without this the crate re-resolves the (possibly inexact) version
-        // requirement and extracts a pristine install *inside* the variant —
-        // and then runs that copy, which has no extensions.
-        settings.trust_installation_dir = true;
-        postgresql = PostgreSQL::new(settings);
-        // Installed and initialized already, so this only revalidates.
+    let launched: Result<InstanceState> = async {
+        let mut postgresql = PostgreSQL::new(builder.build());
         postgresql
             .setup()
             .await
-            .context("failed to adopt the extension variant")?;
-    }
+            .context("failed to set up Postgres")?;
 
-    // With no password configured, drop the auth requirement entirely — the
-    // server only listens on loopback, and a URL with no secret in it is far
-    // easier to paste, log, and hand to an agent.
-    let passwordless = !resuming && configured_password.is_none();
-    if passwordless {
-        write_trust_hba(&data_dir)?;
-    }
+        // `setup` resolves the requirement to a concrete install, and the
+        // directory it picked is named for the version we actually got —
+        // `settings.version` may still be the bare requirement (`*`). Read it
+        // now: a variant swap below renames the directory to the variant key,
+        // which must never leak into the recorded version.
+        let resolved_pg_version = postgresql
+            .settings()
+            .installation_dir
+            .file_name()
+            .map_or_else(
+                || postgresql.settings().version.to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
 
-    if let Err(start_error) = postgresql.start().await {
-        // Our own postmaster may have come up anyway (e.g. the readiness wait
-        // timed out) — stop it rather than orphan it behind the error. Only a
-        // port that is still bound afterwards belongs to someone else.
-        let _ = postgresql.stop().await;
-        if port.is_some_and(tcp_port_is_bound) {
-            return Err(crate::error::coded(
-                crate::error::PORT_BUSY,
-                format!("port {} is held by another process", port.unwrap()),
-            ));
+        let extension_specs = crate::extensions::specs(&project.config)?;
+        // Contrib extensions ship inside the install itself — verify they exist
+        // for this version now, while the error can still explain the options.
+        if !resuming {
+            crate::extensions::ensure_contrib_available(
+                &postgresql.settings().installation_dir,
+                &extension_specs,
+            )?;
         }
-        return Err(start_error).context("failed to start Postgres");
-    }
 
-    // A fresh instance gets the template database only; the caller seeds it,
-    // locks it, and clones `database` from it — so `database` is born
-    // identical to every future test database. A resumed instance already
-    // has both.
-    if !resuming
-        && !postgresql
-            .database_exists(TEMPLATE_DB)
-            .await
+        // Packaged extensions never touch the pristine base install: a fresh
+        // start with any configured runs from a variant — a shared, immutable
+        // clone of the base with the extensions installed. Contrib-only configs
+        // skip all of this and run straight off the base. (A resume already
+        // points at its variant through the saved installation_dir.)
+        let packaged_specs = crate::extensions::packaged(&extension_specs);
+        if !resuming && !packaged_specs.is_empty() {
+            let variant =
+                crate::extensions::ensure_variant(postgresql.settings(), &packaged_specs, json)
+                    .await?;
+            let mut settings = postgresql.settings().clone();
+            settings.installation_dir = variant;
+            // Without this the crate re-resolves the (possibly inexact) version
+            // requirement and extracts a pristine install *inside* the variant —
+            // and then runs that copy, which has no extensions.
+            settings.trust_installation_dir = true;
+            postgresql = PostgreSQL::new(settings);
+            // Installed and initialized already, so this only revalidates.
+            postgresql
+                .setup()
+                .await
+                .context("failed to adopt the extension variant")?;
+        }
+
+        // With no password configured, drop the auth requirement entirely — the
+        // server only listens on loopback, and a URL with no secret in it is far
+        // easier to paste, log, and hand to an agent.
+        let passwordless = !resuming && configured_password.is_none();
+        if passwordless {
+            write_trust_hba(&data_dir)?;
+        }
+
+        if let Err(start_error) = postgresql.start().await {
+            // Our own postmaster may have come up anyway (e.g. the readiness wait
+            // timed out) — stop it rather than orphan it behind the error. Only a
+            // port that is still bound afterwards belongs to someone else.
+            let _ = postgresql.stop().await;
+            if port.is_some_and(tcp_port_is_bound) {
+                return Err(crate::error::coded(
+                    crate::error::PORT_BUSY,
+                    format!("port {} is held by another process", port.unwrap()),
+                ));
+            }
+            return Err(start_error).context("failed to start Postgres");
+        }
+
+        let settings = postgresql.settings();
+        let postmaster_pid = read_postmaster_pid(&data_dir)?;
+        let state = InstanceState {
+            project_dir: project.root.display().to_string(),
+            data_dir: settings.data_dir.display().to_string(),
+            installation_dir: settings.installation_dir.display().to_string(),
+            host: settings.host.clone(),
+            port: settings.port,
+            username: settings.username.clone(),
+            // Under trust auth the role's password is never checked, so we record
+            // none — that is what keeps it out of every URL we hand out.
+            password: if passwordless {
+                String::new()
+            } else {
+                settings.password.clone()
+            },
+            database,
+            pg_version: resolved_pg_version,
+            postmaster_pid: Some(postmaster_pid),
+            expires_at,
+            extensions: crate::extensions::names(&extension_specs),
+            keep,
+        };
+
+        // A fresh instance gets the template database only; the caller seeds it,
+        // locks it, and clones `database` from it — so `database` is born
+        // identical to every future test database. A resumed instance already
+        // has both. This goes through our own psql rather than the crate's
+        // helpers: its connection URL doesn't percent-encode the password.
+        if !resuming
+            && psql_rows(
+                &state,
+                MAINTENANCE_DB,
+                &format!("SELECT 1 FROM pg_database WHERE datname = '{TEMPLATE_DB}'"),
+            )
             .context("failed to check the template database")?
-    {
-        postgresql
-            .create_database(TEMPLATE_DB)
-            .await
+            .is_empty()
+        {
+            psql_exec(
+                &state,
+                MAINTENANCE_DB,
+                &format!("CREATE DATABASE {}", quote_identifier(TEMPLATE_DB)),
+            )
             .context("failed to create the template database")?;
+        }
+
+        state.save(state_dir)?;
+
+        // `PostgreSQL`'s `Drop` shuts the server down. That is exactly wrong here:
+        // the whole point is that it outlives this process until someone stops it.
+        // (On every error path above it is exactly right: the handle drops and
+        // takes a postmaster it started with it.)
+        std::mem::forget(postgresql);
+        Ok(state)
     }
+    .await;
 
-    let settings = postgresql.settings();
-    let postmaster_pid = read_postmaster_pid(&data_dir)?;
-    let state = InstanceState {
-        project_dir: project.root.display().to_string(),
-        data_dir: settings.data_dir.display().to_string(),
-        installation_dir: settings.installation_dir.display().to_string(),
-        host: settings.host.clone(),
-        port: settings.port,
-        username: settings.username.clone(),
-        // Under trust auth the role's password is never checked, so we record
-        // none — that is what keeps it out of every URL we hand out.
-        password: if passwordless {
-            String::new()
-        } else {
-            settings.password.clone()
-        },
-        database,
-        pg_version: resolved_pg_version,
-        postmaster_pid: Some(postmaster_pid),
-        expires_at,
-        extensions: crate::extensions::names(&extension_specs),
-        keep,
+    // A fresh initdb that never became a recorded instance is unusable: with
+    // no state file, every later start would refuse it as unrecoverable. So a
+    // failed fresh start takes its half-built data directory with it.
+    let state = match launched {
+        Ok(state) => state,
+        Err(error) if !resuming => {
+            return Err(match wipe_state_dir(state_dir) {
+                Ok(()) => error,
+                Err(wipe_error) => error.context(format!(
+                    "also failed to remove the half-initialized {}: {wipe_error:#}",
+                    state_dir.display()
+                )),
+            });
+        }
+        Err(error) => return Err(error),
     };
-    state.save(state_dir)?;
-
-    // `PostgreSQL`'s `Drop` shuts the server down. That is exactly wrong here:
-    // the whole point is that it outlives this process until someone stops it.
-    std::mem::forget(postgresql);
 
     project.write_env_file(&state.url())?;
 
