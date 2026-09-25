@@ -4,6 +4,29 @@ All notable changes to popgres are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the version
 is below 1.0, minor releases may change behavior.
 
+## 0.4.2
+
+### Fixed
+
+- **`run` no longer leaves a database behind when interrupted during
+  startup.** Ctrl-C, SIGTERM or SIGHUP while the database was starting or
+  seeding killed popgres outright, orphaning the instance. The first signal
+  now lets startup finish, tears the database down and exits `128 + signal`
+  without running the command; a second signal exits immediately.
+- **SIGTERM reaches `run`'s command.** A SIGTERM sent to popgres alone (by CI
+  or a supervisor) is forwarded to the child instead of waiting out the
+  10-second grace period and killing it. A second signal kills it at once. A
+  duplicate of the same signal within 250 ms — the terminal and the npm
+  launcher both delivering one Ctrl-C — counts once.
+- **Passwords stay out of the process list.** popgres's own `psql` calls
+  (`popgres psql`, seeding, template setup, extensions) pass a configured
+  password in `PGPASSWORD` instead of on the command line.
+- `up` and `run` on an already-running instance fail clearly when it does not
+  match a requested `--pg` or `--port`, instead of silently handing back the
+  instance that is running.
+- `cache --clean` spares variants and PostgreSQL installs used in the last
+  hour, as `gc` already did, so it cannot pull one out from under a start.
+
 ## 0.4.1
 
 ### Fixed

@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::instance::{instance_env, psql_binary};
+use crate::instance::{instance_env, psql_command};
 use crate::project::Project;
 use crate::state::InstanceState;
 
@@ -26,9 +26,8 @@ pub fn run(project: &Project, state: &InstanceState, recipe: &str, json: bool) -
         &format!("popgres: seeding from {recipe}"),
     );
     let mut command = if is_sql_file {
-        let mut command = std::process::Command::new(psql_binary(state)?);
+        let mut command = psql_command(state, &state.database)?;
         command
-            .arg(state.url())
             .args(["--quiet", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-f"])
             .arg(&path);
         command

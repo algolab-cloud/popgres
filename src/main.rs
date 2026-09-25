@@ -13,6 +13,7 @@ mod instance;
 mod project;
 mod registry;
 mod seed;
+mod signals;
 mod state;
 
 use clap::{Parser, Subcommand};

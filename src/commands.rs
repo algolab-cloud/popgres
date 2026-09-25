@@ -4,23 +4,29 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::instance::{self, instance_env, instance_is_running, psql_binary, Started};
+use crate::instance::{self, instance_env, instance_is_running, Started};
 use crate::project::Project;
 use crate::seed;
+use crate::signals::{Kind, Signals};
 use crate::state::InstanceState;
 
-/// How long a child gets to wind down on its own after Ctrl-C before we insist.
+/// How long a child gets to wind down on its own after a signal before we insist.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// One lifecycle message, in whichever shape the invocation asked for.
 /// JSON events and human messages both go to stderr; stdout stays reserved
 /// for results (and for `run`'s child).
+///
+/// A failed write is ignored rather than a panic like `eprintln!`: after a
+/// hang-up the terminal is gone, and teardown must still run to the end.
 pub(crate) fn emit_event(json: bool, event: serde_json::Value, human: &str) {
-    if json {
-        eprintln!("{event}");
+    use std::io::Write;
+    let line = if json {
+        event.to_string()
     } else {
-        eprintln!("{human}");
-    }
+        human.to_string()
+    };
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 /// The one JSON shape describing a started instance, shared by `up` and
@@ -275,19 +281,38 @@ pub async fn run(
     json: bool,
     cmd: Vec<String>,
 ) -> Result<()> {
+    // Listen before anything starts: a signal that killed popgres between
+    // starting the database and tearing it down would orphan the database.
+    let signals = Signals::listen(json);
     let project = Project::discover()?;
-    let started = instance::start(&project, keep, port, pg, ttl, json).await?;
+    let started = instance::start(&project, keep, port, pg, ttl, json)
+        .await
+        .map_err(|error| interrupted_or(&signals, error))?;
     let already_running = started.already_running;
 
     // `run` promises disposal, so anything that fails between here and the
     // child's exit — seeding included — must still tear the instance down.
     if let Err(seed_error) = seed_if_fresh(&project, &started, json) {
+        let seed_error = interrupted_or(&signals, seed_error);
         return match cleanup_after_run(&project, already_running, json).await {
             Ok(()) => Err(seed_error),
             Err(cleanup_error) => Err(with_cleanup_failure(seed_error, cleanup_error)),
         };
     }
     let state = started.state;
+
+    // Interrupted while starting: tear down instead of running the command.
+    // Startup ends first, so a signal landing after this check is the
+    // command phase's to handle rather than slipping between the two.
+    signals.end_startup();
+    if let Some(kind) = signals.received().last {
+        let interrupted =
+            crate::error::coded(kind.exit_code(), "interrupted before the command started");
+        return match cleanup_after_run(&project, already_running, json).await {
+            Ok(()) => Err(interrupted),
+            Err(cleanup_error) => Err(with_cleanup_failure(interrupted, cleanup_error)),
+        };
+    }
 
     if json {
         let mut ready = instance_payload(&state, already_running);
@@ -321,19 +346,21 @@ pub async fn run(
 
     let status: Result<_> = tokio::select! {
         result = child.wait() => result.context("failed to wait for the child process"),
-        () = shutdown_signal() => {
-            // Ctrl-C reaches the whole foreground process group, so the child is
-            // usually already on its way out — let it finish before insisting.
-            match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
-                Ok(result) => result.context("failed to wait for the child process"),
-                Err(_) => {
-                    emit_event(
-                        json,
-                        serde_json::json!({ "event": "killing_child" }),
-                        "popgres: command did not exit, killing it",
-                    );
-                    child.start_kill().ok();
-                    child.wait().await.context("failed to wait for the child process")
+        received = signals.reached(1) => {
+            // Ctrl-C and a terminal hang-up reach the whole foreground process
+            // group, so the child already has those. A SIGTERM is usually
+            // aimed at popgres alone (CI, a supervisor): pass it on, so the
+            // child hears it now rather than a SIGKILL after the grace period.
+            if received.last == Some(Kind::Terminate) {
+                forward_terminate(&child);
+            }
+            tokio::select! {
+                result = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()) => match result {
+                    Ok(result) => result.context("failed to wait for the child process"),
+                    Err(_) => kill_child(&mut child, json, "popgres: command did not exit, killing it").await,
+                },
+                _ = signals.reached(received.count + 1) => {
+                    kill_child(&mut child, json, "popgres: interrupted again, killing the command").await
                 }
             }
         }
@@ -346,9 +373,10 @@ pub async fn run(
             // it even when the teardown afterwards failed.
             let exit_code = child_exit_code(&status);
             if json {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({ "event": "exit", "exit_code": exit_code })
+                emit_event(
+                    json,
+                    serde_json::json!({ "event": "exit", "exit_code": exit_code }),
+                    "",
                 );
             }
             match cleanup {
@@ -413,21 +441,41 @@ fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
     1
 }
 
-/// Resolves when the user (or the OS) asks us to shut down.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut term) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-            return;
+/// An error from a startup the user interrupted exits as interrupted: the
+/// signal, not the failure it caused along the way, is what happened.
+fn interrupted_or(signals: &Signals, error: anyhow::Error) -> anyhow::Error {
+    match signals.received().last {
+        Some(kind) => crate::error::coded(kind.exit_code(), format!("interrupted: {error:#}")),
+        None => error,
+    }
+}
+
+async fn kill_child(
+    child: &mut tokio::process::Child,
+    json: bool,
+    human: &str,
+) -> Result<std::process::ExitStatus> {
+    emit_event(json, serde_json::json!({ "event": "killing_child" }), human);
+    child.start_kill().ok();
+    child
+        .wait()
+        .await
+        .context("failed to wait for the child process")
+}
+
+#[cfg(unix)]
+fn forward_terminate(child: &tokio::process::Child) {
+    // `id` is `None` once the child has been reaped, so the PID is still ours.
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: kill(2) takes plain integers and touches no memory.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
         }
     }
-    let _ = tokio::signal::ctrl_c().await;
 }
+
+#[cfg(not(unix))]
+fn forward_terminate(_child: &tokio::process::Child) {}
 
 pub async fn down(keep_flag: bool, wipe_flag: bool, json: bool) -> Result<()> {
     let project = Project::discover()?;
@@ -464,12 +512,10 @@ pub fn url(json: bool) -> Result<()> {
 
 pub fn psql(args: Vec<String>) -> Result<()> {
     let state = Project::discover()?.running_instance()?;
-    let binary = psql_binary(&state)?;
-    let status = std::process::Command::new(&binary)
-        .arg(state.url())
+    let status = instance::psql_command(&state, &state.database)?
         .args(&args)
         .status()
-        .with_context(|| format!("failed to run {}", binary.display()))?;
+        .context("failed to run psql")?;
     std::process::exit(child_exit_code(&status));
 }
 
@@ -755,7 +801,15 @@ pub fn cache(clean: bool, all: bool, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    let verdict = |referenced: bool| if referenced { "in use" } else { "unused" };
+    let verdict = |entry: &crate::cache::PoolEntry| {
+        if entry.referenced {
+            "in use"
+        } else if entry.recently_used {
+            "recently used"
+        } else {
+            "unused"
+        }
+    };
     if !report.postgres.is_empty() {
         println!("PostgreSQL installs (shared download cache):");
         for entry in &report.postgres {
@@ -763,7 +817,7 @@ pub fn cache(clean: bool, all: bool, json: bool) -> Result<()> {
                 "  {:<26} {:>9}  {}",
                 entry.name,
                 crate::cache::human_size(entry.size_bytes),
-                verdict(entry.referenced)
+                verdict(entry)
             );
         }
     }
@@ -774,7 +828,7 @@ pub fn cache(clean: bool, all: bool, json: bool) -> Result<()> {
                 "  {:<26} {:>9}  {}",
                 entry.name,
                 crate::cache::human_size(entry.size_bytes),
-                verdict(entry.referenced)
+                verdict(entry)
             );
         }
     }
