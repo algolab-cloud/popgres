@@ -31,14 +31,16 @@ pub(crate) fn emit_event(json: bool, event: serde_json::Value, human: &str) {
 
 /// The one JSON shape describing a started instance, shared by `up` and
 /// `run`'s "ready" event so the two can never drift apart.
-fn instance_payload(state: &InstanceState, already_running: bool) -> serde_json::Value {
+fn instance_payload(started: &Started) -> serde_json::Value {
+    let state = &started.state;
     serde_json::json!({
         "url": state.url(),
         "host": state.host,
         "port": state.port,
         "database": state.database,
         "expires_at": state.expires_at,
-        "already_running": already_running,
+        "already_running": started.already_running,
+        "restored_from_cache": started.restored,
     })
 }
 
@@ -49,6 +51,16 @@ fn instance_payload(state: &InstanceState, already_running: bool) -> serde_json:
 /// cloned from it. Cloning from a locked template cannot fail on stray
 /// connections, and every later `popgres testdb` clone is born from exactly
 /// what the working database started as.
+/// Ready a fresh instance, then put the result in the seed cache so the
+/// next fresh start of the same project can skip initdb and the seed.
+async fn ready_fresh(project: &Project, started: &mut Started, json: bool) -> Result<()> {
+    seed_if_fresh(project, started, json)?;
+    if started.freshly_initialized {
+        started.state = instance::cache_seeded(project, &started.state, json).await?;
+    }
+    Ok(())
+}
+
 fn seed_if_fresh(project: &Project, started: &Started, json: bool) -> Result<()> {
     if !started.freshly_initialized {
         return Ok(());
@@ -252,19 +264,20 @@ pub async fn up(
     json: bool,
 ) -> Result<bool> {
     let project = Project::discover()?;
-    let started = instance::start(&project, keep, port, pg, ttl, json).await?;
+    let mut started = instance::start(&project, keep, port, pg, ttl, json).await?;
     // A failed seed leaves the instance up on purpose: the error says so, and
     // the user can inspect or fix and re-seed. `run` is the disposal command.
-    seed_if_fresh(&project, &started, json)?;
-    emit_up(&started.state, json, started.already_running);
+    ready_fresh(&project, &mut started, json).await?;
+    emit_up(&started, json);
     Ok(started.already_running)
 }
 
-fn emit_up(state: &InstanceState, json: bool, already: bool) {
+fn emit_up(started: &Started, json: bool) {
+    let state = &started.state;
     if json {
-        println!("{}", instance_payload(state, already));
+        println!("{}", instance_payload(started));
     } else {
-        if already {
+        if started.already_running {
             eprintln!("popgres: already running on port {}", state.port);
         } else {
             eprintln!("popgres: up on port {}", state.port);
@@ -285,21 +298,21 @@ pub async fn run(
     // starting the database and tearing it down would orphan the database.
     let signals = Signals::listen(json);
     let project = Project::discover()?;
-    let started = instance::start(&project, keep, port, pg, ttl, json)
+    let mut started = instance::start(&project, keep, port, pg, ttl, json)
         .await
         .map_err(|error| interrupted_or(&signals, error))?;
     let already_running = started.already_running;
 
     // `run` promises disposal, so anything that fails between here and the
     // child's exit — seeding included — must still tear the instance down.
-    if let Err(seed_error) = seed_if_fresh(&project, &started, json) {
+    if let Err(seed_error) = ready_fresh(&project, &mut started, json).await {
         let seed_error = interrupted_or(&signals, seed_error);
         return match cleanup_after_run(&project, already_running, json).await {
             Ok(()) => Err(seed_error),
             Err(cleanup_error) => Err(with_cleanup_failure(seed_error, cleanup_error)),
         };
     }
-    let state = started.state;
+    let state = started.state.clone();
 
     // Interrupted while starting: tear down instead of running the command.
     // Startup ends first, so a signal landing after this check is the
@@ -315,7 +328,7 @@ pub async fn run(
     }
 
     if json {
-        let mut ready = instance_payload(&state, already_running);
+        let mut ready = instance_payload(&started);
         ready["event"] = "ready".into();
         eprintln!("{ready}");
     } else if already_running {
@@ -531,8 +544,8 @@ pub async fn reset(json: bool) -> Result<()> {
     // Reset means fresh, so the data goes even for a --keep instance. The
     // stop and start happen under one lock, keeping the port — and so the
     // URL — stable for anything already pointed at it.
-    let started = instance::reset(&project, &state, json).await?;
-    seed_if_fresh(&project, &started, json)?;
+    let mut started = instance::reset(&project, &state, json).await?;
+    ready_fresh(&project, &mut started, json).await?;
 
     if json {
         println!(
@@ -542,6 +555,7 @@ pub async fn reset(json: bool) -> Result<()> {
                 "url": started.state.url(),
                 "port": started.state.port,
                 "database": started.state.database,
+                "reseeded": started.freshly_initialized,
             })
         );
     } else {
@@ -697,7 +711,11 @@ fn ttl_label(expires_at: Option<u64>, now: u64) -> String {
 /// This is the only command that touches instances outside the current
 /// project, and it never destroys anything that has not expired.
 pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
-    let (swept, evicted_variants) = instance::gc(dry_run).await?;
+    let instance::Sweep {
+        instances: swept,
+        evicted_variants,
+        evicted_seeds,
+    } = instance::gc(dry_run).await?;
     let mut reaped = Vec::new();
     for (state_dir, outcome) in &swept {
         match outcome {
@@ -745,6 +763,19 @@ pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
             ),
         );
     }
+    for seed in &evicted_seeds {
+        emit_event(
+            json,
+            serde_json::json!({
+                "event": if dry_run { "would_evict_seed" } else { "evicted_seed" },
+                "seed_key": seed,
+            }),
+            &format!(
+                "popgres: {} cached seeded database {seed}, unused for a week",
+                if dry_run { "would evict" } else { "evicted" }
+            ),
+        );
+    }
 
     if json {
         println!(
@@ -757,22 +788,25 @@ pub async fn gc(dry_run: bool, json: bool) -> Result<()> {
                 })).collect::<Vec<_>>(),
                 "examined": swept.len(),
                 "evicted_variants": evicted_variants,
+                "evicted_seeds": evicted_seeds,
                 "dry_run": dry_run,
             })
         );
-    } else if reaped.is_empty() && evicted_variants.is_empty() {
+    } else if reaped.is_empty() && evicted_variants.is_empty() && evicted_seeds.is_empty() {
         println!("nothing to reap ({} instance(s) examined)", swept.len());
     } else if dry_run {
         println!(
-            "would reap {} expired instance(s) and evict {} unused variant(s) — rerun without --dry-run",
+            "would reap {} expired instance(s), evict {} unused variant(s) and {} cached seed(s) — rerun without --dry-run",
             reaped.len(),
-            evicted_variants.len()
+            evicted_variants.len(),
+            evicted_seeds.len()
         );
     } else {
         println!(
-            "reaped {} expired instance(s), evicted {} unused variant(s)",
+            "reaped {} expired instance(s), evicted {} unused variant(s) and {} cached seed(s)",
             reaped.len(),
-            evicted_variants.len()
+            evicted_variants.len(),
+            evicted_seeds.len()
         );
     }
     Ok(())
@@ -793,6 +827,7 @@ pub fn cache(clean: bool, all: bool, json: bool) -> Result<()> {
             serde_json::json!({
                 "postgres": report.postgres,
                 "variants": report.variants,
+                "seeds": report.seeds,
                 "instances": report.instances,
                 "total_bytes": report.total_bytes,
                 "removed": removed,
@@ -824,6 +859,17 @@ pub fn cache(clean: bool, all: bool, json: bool) -> Result<()> {
     if !report.variants.is_empty() {
         println!("Extension variants:");
         for entry in &report.variants {
+            println!(
+                "  {:<26} {:>9}  {}",
+                entry.name,
+                crate::cache::human_size(entry.size_bytes),
+                verdict(entry)
+            );
+        }
+    }
+    if !report.seeds.is_empty() {
+        println!("Seeded databases (ready-made fresh starts):");
+        for entry in &report.seeds {
             println!(
                 "  {:<26} {:>9}  {}",
                 entry.name,

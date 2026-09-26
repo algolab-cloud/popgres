@@ -10,10 +10,7 @@ use crate::state::InstanceState;
 /// runs as a shell command with `DATABASE_URL` set.
 pub fn run(project: &Project, state: &InstanceState, recipe: &str, json: bool) -> Result<()> {
     let path = project.root.join(recipe);
-    let is_sql_file = path.is_file()
-        && path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"));
+    let is_sql_file = sql_file(project, recipe).is_some();
     // A lone `*.sql` word that isn't a file is a mistyped path, not a shell
     // command — say so instead of letting `sh` report "not found".
     if !is_sql_file && looks_like_sql_path(recipe) {
@@ -62,6 +59,16 @@ pub fn run(project: &Project, state: &InstanceState, recipe: &str, json: bool) -
         bail!("seed `{recipe}` failed ({status}) — the database is up but not seeded");
     }
     Ok(())
+}
+
+/// The seed as a `.sql` file in the project, if that is what it names.
+pub fn sql_file(project: &Project, recipe: &str) -> Option<std::path::PathBuf> {
+    let path = project.root.join(recipe);
+    let is_sql = path.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"));
+    is_sql.then_some(path)
 }
 
 fn looks_like_sql_path(recipe: &str) -> bool {

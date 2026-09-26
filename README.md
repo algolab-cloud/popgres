@@ -133,7 +133,50 @@ ttl = "30m"              # dispose of the instance after this long
 seed = "./db/seed.sql"   # run after fresh initialization
 env_file = ".env.local"  # write DATABASE_URL while running
 location = "local"       # or "global": keep the project tree free of db files
+fast = true              # trade durability for speed (see below)
+
+[settings]               # any PostgreSQL server setting
+max_connections = 200
+log_statement = "all"
 ```
+
+### Faster tests
+
+`fast = true` turns off `fsync`, `synchronous_commit` and
+`full_page_writes`. A disposable database doesn't need crash durability, and
+write-heavy suites often run noticeably faster without it. Don't combine it
+with `keep = true` for data you care about: a crash can corrupt it.
+
+`[settings]` takes any PostgreSQL server setting and wins over `fast`.
+Settings are applied on every start, so a change takes effect the next time
+the instance starts, including when a kept instance resumes.
+
+### Seed cache
+
+initdb is most of a fresh start, and a seed can take much longer. After a
+fresh instance is initialized and seeded, popgres keeps a copy of it. The
+next fresh start with the same inputs copies it into place instead: no
+initdb, no seed. A `run` then takes a fraction of a second.
+
+The copy is keyed by everything that shapes it: the PostgreSQL version,
+extensions, password, settings, and the seed. A `.sql` seed is hashed by
+content, so editing it invalidates the cache. A command seed (`seed = "npm
+run db:setup"`) reads files popgres can't guess, so it is cached only when
+you list them:
+
+```toml
+seed = "npm run db:setup"
+seed_inputs = ["db/migrations", "db/seeds", "package-lock.json"]
+```
+
+Directories are hashed recursively. If a `.sql` seed includes other files
+(`\i`), list those too. `seed_cache = false` turns the cache off. `popgres
+reset` benefits as well: when the seed hasn't changed, it re-clones the
+seeded template instead of running the seed again.
+
+Each project keeps its three most recent entries. `popgres gc` evicts
+entries unused for a week, and `popgres cache --clean` removes any not used
+in the last hour.
 
 ## Test databases for parallel workers
 
@@ -151,8 +194,8 @@ global setup hook and they stop colliding on shared rows and truncations.
 Clones are real databases: use transaction rollback or truncation *within* a
 worker as usual. `--name worker_1` names a clone; named clones are yours to
 drop. Because the working database is itself a clone of the template,
-`popgres reset` on a running instance is also fast: it rebuilds the template
-and re-clones in well under a second, on the same port, re-running your seed.
+`popgres reset` on a running instance is also fast: it re-clones in well
+under a second, on the same port, re-running your seed only if it changed.
 
 ## Extensions
 
@@ -202,8 +245,9 @@ name says what is.
 
 `popgres cache` shows everything popgres keeps on disk — PostgreSQL versions,
 extension variants, and each instance — with what is in use and what is not.
-`popgres cache --clean` removes unused extension variants (anything used in
-the last hour is spared, in case a start is picking it up); adding `--all`
+`popgres cache --clean` removes unused extension variants and cached seeded
+databases (anything used in the last hour is spared, in case a start is
+picking it up); adding `--all`
 also removes PostgreSQL versions no popgres instance references (the download
 cache may be shared with other tools built on postgresql-embedded, so this
 step is opt-in). Instance data is never touched — that is what `down` and

@@ -33,6 +33,8 @@ pub struct Started {
     pub already_running: bool,
     /// A brand-new initdb — the caller should run the seed hook.
     pub freshly_initialized: bool,
+    /// Copied from the seed cache: initialized and seeded already.
+    pub restored: bool,
 }
 
 /// What we could establish about the recorded instance.
@@ -316,23 +318,51 @@ pub async fn reset(project: &Project, state: &InstanceState, json: bool) -> Resu
             "SELECT datname FROM pg_database \
              WHERE datname NOT IN ('postgres', 'template0', 'template1')",
         )?;
-        for database in managed {
+        // The template is locked against connections, so it is exactly what
+        // its seed produced. If that seed has not changed, keep it and skip
+        // re-seeding: reset becomes a single database clone.
+        let key = seed_key_for(project, &current)?;
+        let keep_template = key.is_some()
+            && key == current.seed_key
+            && managed.iter().any(|database| database == TEMPLATE_DB);
+        for database in &managed {
+            if keep_template && database == TEMPLATE_DB {
+                continue;
+            }
             psql_exec(
                 &current,
                 MAINTENANCE_DB,
-                &format!("DROP DATABASE {} WITH (FORCE)", quote_identifier(&database)),
+                &format!("DROP DATABASE {} WITH (FORCE)", quote_identifier(database)),
             )?;
         }
-        psql_exec(
-            &current,
-            MAINTENANCE_DB,
-            &format!("CREATE DATABASE {}", quote_identifier(TEMPLATE_DB)),
-        )?;
+        if keep_template {
+            psql_exec(
+                &current,
+                MAINTENANCE_DB,
+                &format!(
+                    "CREATE DATABASE {} TEMPLATE {}",
+                    quote_identifier(&current.database),
+                    quote_identifier(TEMPLATE_DB)
+                ),
+            )?;
+            emit_event(
+                json,
+                serde_json::json!({ "event": "template_reused" }),
+                "popgres: the seed is unchanged — recreated the database from its seeded template",
+            );
+        } else {
+            psql_exec(
+                &current,
+                MAINTENANCE_DB,
+                &format!("CREATE DATABASE {}", quote_identifier(TEMPLATE_DB)),
+            )?;
+        }
         project.write_env_file(&current.url())?;
         return Ok(Started {
             state: current,
             already_running: false,
-            freshly_initialized: true,
+            freshly_initialized: !keep_template,
+            restored: false,
         });
     }
 
@@ -466,6 +496,7 @@ async fn start_locked(
                     state,
                     already_running: true,
                     freshly_initialized: false,
+                    restored: false,
                 });
             }
             Liveness::NotRunning => {}
@@ -555,15 +586,33 @@ async fn start_locked(
         builder = builder.port(port);
     }
 
-    if !resuming {
-        emit_event(
-            json,
-            serde_json::json!({ "event": "initializing" }),
-            "popgres: initializing a fresh database (the first run of a Postgres version downloads it)...",
-        );
-    }
+    let server_settings = project.config.server_settings()?;
+    let extension_specs = crate::extensions::specs(&project.config)?;
+    let mut restored: Option<Restored> = None;
     let launched: Result<InstanceState> = async {
-        let mut postgresql = PostgreSQL::new(builder.build());
+        let mut settings = builder.build();
+        // A fresh instance with a ready-made copy in the seed cache skips
+        // initdb and the seed alike.
+        if !resuming {
+            restored = restore_cached(
+                project,
+                &mut settings,
+                &database,
+                configured_password.as_deref(),
+                &extension_specs,
+                &server_settings,
+                json,
+            )
+            .await?;
+            if restored.is_none() {
+                emit_event(
+                    json,
+                    serde_json::json!({ "event": "initializing" }),
+                    "popgres: initializing a fresh database (the first run of a Postgres version downloads it)...",
+                );
+            }
+        }
+        let mut postgresql = PostgreSQL::new(settings);
         postgresql
             .setup()
             .await
@@ -574,16 +623,20 @@ async fn start_locked(
         // `settings.version` may still be the bare requirement (`*`). Read it
         // now: a variant swap below renames the directory to the variant key,
         // which must never leak into the recorded version.
-        let resolved_pg_version = postgresql
-            .settings()
-            .installation_dir
-            .file_name()
-            .map_or_else(
-                || postgresql.settings().version.to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            );
+        // (A restored instance already runs from its variant, so it carries
+        // the version it resolved when it was cached.)
+        let resolved_pg_version = match &restored {
+            Some(restored) => restored.pg_version.clone(),
+            None => postgresql
+                .settings()
+                .installation_dir
+                .file_name()
+                .map_or_else(
+                    || postgresql.settings().version.to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
+        };
 
-        let extension_specs = crate::extensions::specs(&project.config)?;
         // Contrib extensions ship inside the install itself — verify they exist
         // for this version now, while the error can still explain the options.
         if !resuming {
@@ -599,7 +652,7 @@ async fn start_locked(
         // skip all of this and run straight off the base. (A resume already
         // points at its variant through the saved installation_dir.)
         let packaged_specs = crate::extensions::packaged(&extension_specs);
-        if !resuming && !packaged_specs.is_empty() {
+        if !resuming && restored.is_none() && !packaged_specs.is_empty() {
             let variant =
                 crate::extensions::ensure_variant(postgresql.settings(), &packaged_specs, json)
                     .await?;
@@ -624,6 +677,9 @@ async fn start_locked(
         if passwordless {
             write_trust_hba(&data_dir)?;
         }
+        // Rewritten on every start, so a settings change applies to a
+        // resumed instance too.
+        write_server_settings(&data_dir, &server_settings)?;
 
         if let Err(start_error) = postgresql.start().await {
             // Our own postmaster may have come up anyway (e.g. the readiness wait
@@ -660,6 +716,14 @@ async fn start_locked(
             postmaster_pid: Some(postmaster_pid),
             expires_at,
             extensions: crate::extensions::names(&extension_specs),
+            // A resumed template is whatever it was; a restored one is exactly
+            // what the cache key describes; a fresh one gets its key once the
+            // caller has seeded it.
+            seed_key: if resuming {
+                previous.as_ref().and_then(|previous| previous.seed_key.clone())
+            } else {
+                restored.as_ref().map(|restored| restored.key.clone())
+            },
             keep,
         };
 
@@ -718,8 +782,245 @@ async fn start_locked(
     Ok(Started {
         state,
         already_running: false,
-        freshly_initialized: !resuming,
+        freshly_initialized: !resuming && restored.is_none(),
+        restored: restored.is_some(),
     })
+}
+
+/// A fresh start served from the seed cache.
+struct Restored {
+    key: String,
+    pg_version: String,
+}
+
+/// Copy a cached, ready-made data directory into place and point `settings`
+/// at the install it was built with. `None` — with nothing left behind —
+/// when the install still has to be downloaded, the project's seed cannot be
+/// cached, nothing is cached yet, or the copy fails.
+async fn restore_cached(
+    project: &Project,
+    settings: &mut Settings,
+    database: &str,
+    password: Option<&str>,
+    specs: &[crate::extensions::ExtensionSpec],
+    server_settings: &std::collections::BTreeMap<String, String>,
+    json: bool,
+) -> Result<Option<Restored>> {
+    let Some(base) = locally_installed(settings) else {
+        return Ok(None);
+    };
+    let Some(pg_version) = base
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Ok(None);
+    };
+    let packaged = crate::extensions::packaged(specs);
+    let installation = if packaged.is_empty() {
+        base.clone()
+    } else {
+        let mut base_settings = settings.clone();
+        base_settings.installation_dir = base;
+        base_settings.trust_installation_dir = true;
+        crate::extensions::ensure_variant(&base_settings, &packaged, json).await?
+    };
+    let names = crate::extensions::names(specs);
+    let Some(key) = crate::seed_cache::key(
+        project,
+        &crate::seed_cache::Fingerprint {
+            installation_dir: &installation,
+            pg_version: &pg_version,
+            database,
+            username: &settings.username,
+            password,
+            extensions: &names,
+            settings: server_settings,
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    match crate::seed_cache::restore(&key, &settings.data_dir) {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        // A cache is an optimization: a broken entry means a normal start.
+        Err(error) => {
+            emit_event(
+                json,
+                serde_json::json!({ "event": "seed_cache_error", "reason": format!("{error:#}") }),
+                &format!("popgres: ignoring the seed cache: {error:#}"),
+            );
+            return Ok(None);
+        }
+    }
+    settings.installation_dir = installation;
+    settings.trust_installation_dir = true;
+    emit_event(
+        json,
+        serde_json::json!({ "event": "restored", "seed_key": key }),
+        "popgres: restored a ready-made database from the seed cache (no initdb, no seed)",
+    );
+    Ok(Some(Restored { key, pg_version }))
+}
+
+/// The install `setup` would choose without downloading anything — the
+/// same search the crate runs first, done up front so a cached data
+/// directory can go into place before initdb would. `None` means a download.
+fn locally_installed(settings: &Settings) -> Option<PathBuf> {
+    let root = &settings.installation_dir;
+    if settings.trust_installation_dir {
+        return Some(root.clone());
+    }
+    let own_version = root
+        .file_name()
+        .and_then(|name| Version::parse(&name.to_string_lossy()).ok());
+    if own_version.is_some_and(|version| settings.version.matches(&version)) && root.exists() {
+        return Some(root.clone());
+    }
+    std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let version = Version::parse(&entry.file_name().to_string_lossy()).ok()?;
+            settings
+                .version
+                .matches(&version)
+                .then(|| (version, entry.path()))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, path)| path)
+}
+
+/// The seed cache key for an instance as recorded, or `None` if its
+/// project cannot be cached.
+pub fn seed_key_for(project: &Project, state: &InstanceState) -> Result<Option<String>> {
+    let settings = project.config.server_settings()?;
+    crate::seed_cache::key(
+        project,
+        &crate::seed_cache::Fingerprint {
+            installation_dir: Path::new(&state.installation_dir),
+            pg_version: &state.pg_version,
+            database: &state.database,
+            username: &state.username,
+            password: Some(state.password.as_str()).filter(|password| !password.is_empty()),
+            extensions: &state.extensions,
+            settings: &settings,
+        },
+    )
+}
+
+/// Seed cache keys some instance's template was built under — never evicted.
+pub fn referenced_seed_keys() -> Vec<String> {
+    discoverable_state_dirs()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|dir| InstanceState::load(dir).ok().flatten())
+        .filter_map(|state| state.seed_key)
+        .collect()
+}
+
+/// Put a freshly seeded instance into the seed cache, so the next fresh
+/// start copies it instead of running initdb and the seed.
+///
+/// The copy needs the server stopped; it comes straight back on the same
+/// port, and nothing has connected yet. Failing to store is only reported —
+/// the instance itself is fine — but failing to restart is an error.
+pub async fn cache_seeded(
+    project: &Project,
+    state: &InstanceState,
+    json: bool,
+) -> Result<InstanceState> {
+    let Some(key) = seed_key_for(project, state)? else {
+        return Ok(state.clone());
+    };
+    let state_dir = project.state_dir.as_path();
+    let _lock = StateLock::acquire(state_dir, json)?;
+    let Some(current) = InstanceState::load(state_dir)? else {
+        bail!("the popgres instance disappeared before it could be cached — retry the command");
+    };
+    if current != *state {
+        bail!("the popgres instance changed while waiting for the state lock — retry the command");
+    }
+    let mut recorded = InstanceState {
+        seed_key: Some(key.clone()),
+        ..current
+    };
+
+    if !crate::seed_cache::contains(&key)? {
+        emit_event(
+            json,
+            serde_json::json!({ "event": "caching_seed", "seed_key": key }),
+            "popgres: caching the seeded database — the next fresh start skips initdb and the seed...",
+        );
+        PostgreSQL::new(settings_for(state_dir, &recorded))
+            .stop()
+            .await
+            .context("failed to stop Postgres to cache the seeded database")?;
+        let stored = crate::seed_cache::store(
+            &key,
+            Path::new(&recorded.data_dir),
+            &crate::seed_cache::Manifest {
+                project_dir: recorded.project_dir.clone(),
+                pg_version: recorded.pg_version.clone(),
+                created_at: crate::state::now_unix(),
+            },
+            &referenced_seed_keys(),
+        );
+        let mut postgresql = PostgreSQL::new(settings_for(state_dir, &recorded));
+        postgresql
+            .start()
+            .await
+            .context("failed to restart Postgres after caching the seeded database")?;
+        std::mem::forget(postgresql);
+        recorded.postmaster_pid = Some(read_postmaster_pid(Path::new(&recorded.data_dir))?);
+        if let Err(error) = stored {
+            emit_event(
+                json,
+                serde_json::json!({ "event": "seed_cache_error", "reason": format!("{error:#}") }),
+                &format!("popgres: could not cache the seeded database: {error:#}"),
+            );
+        }
+    }
+    recorded.save(state_dir)?;
+    Ok(recorded)
+}
+
+/// `postgresql.conf` includes this file, which popgres rewrites from
+/// `popgres.toml` on every start.
+const SETTINGS_FILE: &str = "popgres.conf";
+const SETTINGS_INCLUDE: &str = "include_if_exists = 'popgres.conf'";
+
+/// Write the project's server settings into the data directory. A file
+/// rather than `-c` flags: the crate passes those through a shell command
+/// line, where a value with a space or quote would break.
+fn write_server_settings(
+    data_dir: &Path,
+    settings: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let mut contents = String::from(
+        "# Written by popgres from popgres.toml on every start — edits are overwritten.\n",
+    );
+    for (name, value) in settings {
+        contents.push_str(&format!("{name} = {value}\n"));
+    }
+    let path = data_dir.join(SETTINGS_FILE);
+    std::fs::write(&path, contents).with_context(|| format!("cannot write {}", path.display()))?;
+
+    let conf = data_dir.join("postgresql.conf");
+    let current = std::fs::read_to_string(&conf)
+        .with_context(|| format!("cannot read {}", conf.display()))?;
+    if !current.contains(SETTINGS_INCLUDE) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&conf)
+            .with_context(|| format!("cannot open {}", conf.display()))?;
+        writeln!(file, "\n# Settings from popgres.toml\n{SETTINGS_INCLUDE}")
+            .with_context(|| format!("cannot write {}", conf.display()))?;
+    }
+    Ok(())
 }
 
 async fn stop_locked(project: &Project, state: &InstanceState, keep: bool) -> Result<()> {
@@ -768,7 +1069,14 @@ pub enum Reaped {
 /// Each project is taken under its own lock and skipped if busy, so a sweep can
 /// never interrupt a start in progress. An instance whose liveness cannot be
 /// confirmed is reported rather than wiped, exactly as `stop` treats it.
-pub async fn gc(dry_run: bool) -> Result<(Vec<(PathBuf, Reaped)>, Vec<String>)> {
+/// Everything a `gc` pass did.
+pub struct Sweep {
+    pub instances: Vec<(PathBuf, Reaped)>,
+    pub evicted_variants: Vec<String>,
+    pub evicted_seeds: Vec<String>,
+}
+
+pub async fn gc(dry_run: bool) -> Result<Sweep> {
     let state_dirs = discoverable_state_dirs()?;
     // Collected before the sweep, so a variant referenced only by an
     // instance reaped this pass survives until the next one — conservative
@@ -778,6 +1086,7 @@ pub async fn gc(dry_run: bool) -> Result<(Vec<(PathBuf, Reaped)>, Vec<String>)> 
         .filter_map(|dir| InstanceState::load(dir).ok().flatten())
         .map(|state| PathBuf::from(state.installation_dir))
         .collect();
+    let referenced_seeds = referenced_seed_keys();
 
     let mut swept = Vec::new();
     for state_dir in state_dirs {
@@ -785,8 +1094,11 @@ pub async fn gc(dry_run: bool) -> Result<(Vec<(PathBuf, Reaped)>, Vec<String>)> 
             swept.push((state_dir, outcome));
         }
     }
-    let evicted = crate::extensions::evict_unreferenced(&referenced, dry_run)?;
-    Ok((swept, evicted))
+    Ok(Sweep {
+        instances: swept,
+        evicted_variants: crate::extensions::evict_unreferenced(&referenced, dry_run)?,
+        evicted_seeds: crate::seed_cache::evict(&referenced_seeds, dry_run)?,
+    })
 }
 
 /// Sweep one state directory without allowing its failures to abort the
@@ -1055,6 +1367,7 @@ mod tests {
             postmaster_pid: Some(12345),
             expires_at: None,
             extensions: Vec::new(),
+            seed_key: None,
             keep: false,
         }
     }

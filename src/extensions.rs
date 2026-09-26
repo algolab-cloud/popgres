@@ -564,7 +564,7 @@ fn is_temp(path: &Path) -> bool {
 /// Clone a directory tree, using the filesystem's copy-on-write when it has
 /// one (measured: the whole 43 MB install in 0.24 s and ~zero real disk on
 /// APFS) and falling back to a plain recursive copy.
-fn clone_dir(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn clone_dir(source: &Path, target: &Path) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let mut command = std::process::Command::new("cp");

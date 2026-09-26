@@ -1,5 +1,6 @@
 //! Optional per-project configuration: `popgres.toml`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -37,7 +38,28 @@ pub struct Config {
     /// Optional version pins for entries in `extensions`,
     /// e.g. vector = "=0.8.0". Unpinned extensions take the latest build.
     pub extensions_versions: Option<std::collections::BTreeMap<String, String>>,
+    /// Trade durability for speed: fsync, synchronous_commit and
+    /// full_page_writes off. Fine for disposable data; a crash can corrupt
+    /// a kept instance.
+    pub fast: Option<bool>,
+    /// PostgreSQL server settings, e.g. `max_connections = 200`. Applied on
+    /// every start, and they win over `fast`.
+    pub settings: Option<BTreeMap<String, toml::Value>>,
+    /// Files and directories a command `seed` reads (migrations, fixtures).
+    /// Listing them lets the seeded database be cached; a `.sql` seed file
+    /// is covered automatically.
+    pub seed_inputs: Option<Vec<PathBuf>>,
+    /// Reuse a ready-made copy of the initialized, seeded database for fresh
+    /// starts (default: true).
+    pub seed_cache: Option<bool>,
 }
+
+/// What `fast = true` turns off.
+const FAST_SETTINGS: [(&str, &str); 3] = [
+    ("fsync", "off"),
+    ("synchronous_commit", "off"),
+    ("full_page_writes", "off"),
+];
 
 /// Where a project's database lives.
 ///
@@ -68,6 +90,35 @@ impl Config {
 
     pub fn resolved_location(&self) -> Location {
         self.location.unwrap_or_default()
+    }
+
+    /// Server settings as `postgresql.conf` values: the `fast` preset, with
+    /// `[settings]` layered over it.
+    pub fn server_settings(&self) -> Result<BTreeMap<String, String>> {
+        let mut resolved = BTreeMap::new();
+        if self.fast == Some(true) {
+            for (name, value) in FAST_SETTINGS {
+                resolved.insert(name.to_string(), value.to_string());
+            }
+        }
+        for (name, value) in self.settings.iter().flatten() {
+            let plausible = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.');
+            if !plausible {
+                anyhow::bail!("invalid setting name `{name}` in [settings]");
+            }
+            let value = match value {
+                toml::Value::String(text) => format!("'{}'", text.replace('\'', "''")),
+                toml::Value::Integer(number) => number.to_string(),
+                toml::Value::Float(number) => number.to_string(),
+                toml::Value::Boolean(flag) => if *flag { "on" } else { "off" }.to_string(),
+                _ => anyhow::bail!("setting `{name}` must be a string, number or boolean"),
+            };
+            resolved.insert(name.clone(), value);
+        }
+        Ok(resolved)
     }
 }
 
@@ -186,6 +237,31 @@ mod tests {
             parse_ttl(config.ttl.as_deref().unwrap()).unwrap().as_secs(),
             1800
         );
+    }
+
+    #[test]
+    fn fast_is_a_preset_that_explicit_settings_override() {
+        let config: Config = toml::from_str(
+            "fast = true\n[settings]\nfsync = true\nmax_connections = 200\nlog_statement = \"all\"\nsearch_path = \"it's\"",
+        )
+        .unwrap();
+        let settings = config.server_settings().unwrap();
+        assert_eq!(settings["fsync"], "on", "an explicit setting wins");
+        assert_eq!(settings["synchronous_commit"], "off");
+        assert_eq!(settings["full_page_writes"], "off");
+        assert_eq!(settings["max_connections"], "200");
+        assert_eq!(settings["log_statement"], "'all'");
+        assert_eq!(settings["search_path"], "'it''s'");
+
+        assert!(Config::default().server_settings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_setting_is_rejected() {
+        let bad_name: Config = toml::from_str("[settings]\n\"a b\" = 1").unwrap();
+        assert!(bad_name.server_settings().is_err());
+        let bad_value: Config = toml::from_str("[settings]\nx = [1]").unwrap();
+        assert!(bad_value.server_settings().is_err());
     }
 
     #[test]

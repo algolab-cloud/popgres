@@ -167,6 +167,10 @@ pub struct InstanceState {
     /// A resume compares these against the config to catch drift.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// The seed cache key the template was built under, when it is
+    /// cacheable. Lets `reset` keep a template whose seed has not changed.
+    #[serde(default)]
+    pub seed_key: Option<String>,
     /// Persist data across stops (set by `up --keep` or config).
     pub keep: bool,
 }
@@ -344,7 +348,7 @@ fn percent_encode(raw: &str) -> String {
         .collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -366,6 +370,7 @@ mod tests {
             postmaster_pid: Some(12345),
             expires_at: None,
             extensions: Vec::new(),
+            seed_key: None,
             keep: false,
         }
     }

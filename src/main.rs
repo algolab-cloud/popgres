@@ -13,6 +13,7 @@ mod instance;
 mod project;
 mod registry;
 mod seed;
+mod seed_cache;
 mod signals;
 mod state;
 
@@ -118,7 +119,7 @@ enum Command {
     },
     /// Show popgres's disk usage: PostgreSQL versions, extension variants, instances
     Cache {
-        /// Remove unused extension variants
+        /// Remove unused extension variants and cached seeded databases
         #[arg(long)]
         clean: bool,
         /// With --clean, also remove PostgreSQL versions no popgres instance
