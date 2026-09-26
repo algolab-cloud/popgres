@@ -34,7 +34,7 @@ npx @popgres/cli up
 | `popgres url` | Print the connection URL |
 | `popgres psql` | Open a `psql` shell |
 | `popgres testdb` | Clone a disposable database from the seeded template |
-| `popgres reset` | Wipe and recreate the database |
+| `popgres reset` | Recreate the database from its seed |
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
 | `popgres list` | List every instance on this machine |
@@ -53,6 +53,26 @@ npx popgres gc
 Every command accepts `--json` for automation. Popgres also provides stable
 exit codes, serializes concurrent lifecycle changes, and verifies postmaster
 identity before adopting or wiping an instance.
+
+## Fast fresh starts
+
+After a fresh instance is initialized and seeded, popgres keeps a copy of it.
+The next fresh start with the same inputs copies it into place instead of
+running initdb and your seed again, so a fresh `run` takes about half a
+second. A `.sql` seed invalidates the copy when it changes; for a command
+seed, list the files it reads:
+
+```toml
+seed = "npm run db:setup"
+seed_inputs = ["db/migrations", "db/seeds"]
+fast = true   # fsync and friends off: faster tests on disposable data
+
+[settings]    # any PostgreSQL server setting
+max_connections = 200
+```
+
+Ctrl-C or SIGTERM during `run` never leaves a database behind: popgres
+finishes starting, tears it down, and passes SIGTERM on to your command.
 
 ## Extensions included
 
@@ -85,8 +105,8 @@ npx popgres testdb --clean
 ```
 
 The working database is also cloned from that template, so extensions and
-seed data are identical everywhere. A running `popgres reset` rebuilds it on
-the same port without repeating a full PostgreSQL initialization.
+seed data are identical everywhere. A running `popgres reset` re-clones it on
+the same port, re-running the seed only if it changed.
 
 By default instance data lives in the project's self-ignoring `.popgres/`
 directory. Set `location = "global"` for projects in synced folders.
