@@ -4,6 +4,31 @@ All notable changes to popgres are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); while the version
 is below 1.0, minor releases may change behavior.
 
+## 0.5.0
+
+### Added
+
+- **Seed cache: fresh starts in a fraction of a second.** After a fresh
+  instance is initialized and seeded, popgres keeps a copy of its data
+  directory. The next fresh start with the same inputs copies it into place
+  instead of running initdb and the seed. On a 20,000-row seed, `popgres run`
+  went from about 2.2 s to 0.45 s. The cache key covers the PostgreSQL
+  version, extensions, password, settings and the seed; a `.sql` seed is
+  hashed by content, and a command seed is cached only when `seed_inputs`
+  lists the files it reads. `seed_cache = false` opts out.
+- **`reset` skips an unchanged seed.** With the seed unchanged, `popgres
+  reset` re-clones the working database from the seeded template instead of
+  re-running the seed.
+- **`fast = true`** turns off `fsync`, `synchronous_commit` and
+  `full_page_writes` for faster write-heavy tests on disposable data.
+- **`[settings]`** sets any PostgreSQL server setting from `popgres.toml`.
+  Settings are applied on every start, so changes reach a resumed kept
+  instance too.
+- `popgres cache` reports cached seeded databases, and `cache --clean` and
+  `gc` reclaim them. Each project keeps its three most recent entries.
+- `up --json` and `run`'s `ready` event include `restored_from_cache`;
+  `reset --json` includes `reseeded`.
+
 ## 0.4.2
 
 ### Fixed

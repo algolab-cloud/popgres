@@ -98,19 +98,25 @@ because it disposes of what it started. `--ttl` never replaces an explicit
 Prefer JSON for automation:
 
 - `up --json`: `url`, `host`, `port`, `database`, `expires_at`,
-  `already_running`
+  `already_running`, `restored_from_cache`
 - `status --json`: `running`, `url`, `port`, `pg_version`, `keep`,
   `expires_at`, `expired`
 - `down --json`: `stopped`, `wiped`
-- `reset --json`: `reset`, `url`, `port`, `database`
+- `reset --json`: `reset`, `url`, `port`, `database`, `reseeded`
 - `url --json`: `url`
 - `gc --json`: `reaped` (one object per disposed instance), `examined`,
-  `evicted_variants`, `dry_run`
-- `cache --json`: `postgres`, `variants`, `instances` (each entry with
-  `name`, `size_bytes`, `referenced`), `total_bytes`, `removed`. Only run
+  `evicted_variants`, `evicted_seeds`, `dry_run`
+- `cache --json`: `postgres`, `variants`, `seeds`, `instances` (each entry
+  with `name`, `size_bytes`, `referenced`, `recently_used`), `total_bytes`,
+  `removed`. Only run
   `cache --clean` when the user asks to reclaim disk space.
 - `testdb --json`: `url`, `database`, `template`; `testdb --clean --json`:
   `dropped`.
+
+Fresh starts reuse a cached, seeded copy when nothing changed
+(`restored_from_cache` in `up --json`). For a command seed, add the files it
+reads to `seed_inputs` so edits invalidate the cache. `fast = true` speeds up
+tests on disposable data.
 - `list --json`: `instances` (each with `project_dir`, `status`, `running`,
   `port`, `pg_version`, `database`, `keep`, `expires_at`, `expired`,
   `current`), `count`. Read-only, and never includes connection URLs.

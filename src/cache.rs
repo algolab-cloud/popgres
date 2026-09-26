@@ -34,6 +34,8 @@ pub struct Report {
     pub postgres: Vec<PoolEntry>,
     /// Extension variants in popgres's own store.
     pub variants: Vec<PoolEntry>,
+    /// Ready-made data directories in the seed cache.
+    pub seeds: Vec<PoolEntry>,
     /// Instance state directories (data, credentials, locks), local and global.
     pub instances: Vec<PoolEntry>,
     pub total_bytes: u64,
@@ -59,6 +61,28 @@ impl Report {
             referenced.iter().any(|used| used == path)
         })?;
 
+        let referenced_seeds = crate::instance::referenced_seed_keys();
+        let seeds = crate::seed_cache::entries()?
+            .into_iter()
+            .map(|entry| PoolEntry {
+                // Which project it serves says more than a hash does.
+                name: entry.manifest.as_ref().map_or_else(
+                    || entry.key.clone(),
+                    |manifest| {
+                        format!(
+                            "{} [{}]",
+                            manifest.project_dir,
+                            &entry.key[..8.min(entry.key.len())]
+                        )
+                    },
+                ),
+                size_bytes: dir_size(&entry.path),
+                referenced: referenced_seeds.contains(&entry.key),
+                recently_used: entry.recently_used(),
+                path: entry.path,
+            })
+            .collect::<Vec<_>>();
+
         let instances = state_dirs
             .iter()
             .map(|dir| {
@@ -80,22 +104,26 @@ impl Report {
         let total_bytes = postgres
             .iter()
             .chain(&variants)
+            .chain(&seeds)
             .chain(&instances)
             .map(|entry| entry.size_bytes)
             .sum();
         Ok(Self {
             postgres,
             variants,
+            seeds,
             instances,
             total_bytes,
         })
     }
 
-    /// Everything `--clean` would remove: unused variants always, unused
-    /// base installs only with `--all`. Recently used entries never.
+    /// Everything `--clean` would remove: unused variants and cached seeds
+    /// always, unused base installs only with `--all`. Recently used entries
+    /// never.
     pub fn removable(&self, all: bool) -> Vec<&PoolEntry> {
         self.variants
             .iter()
+            .chain(&self.seeds)
             .chain(self.postgres.iter().filter(|_| all))
             .filter(|entry| !entry.referenced && !entry.recently_used)
             .collect()
@@ -232,6 +260,7 @@ mod tests {
                 entry("16.14.0+vector@0.16.105", false),
                 entry("18.4.0+vectors@0.4.0", true),
             ],
+            seeds: vec![entry("/p [abcd1234]", false)],
             instances: vec![],
             total_bytes: 0,
         };
@@ -242,8 +271,11 @@ mod tests {
                 .map(|entry| entry.name.clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(false), ["16.14.0+vector@0.16.105"]);
-        assert_eq!(names(true), ["16.14.0+vector@0.16.105", "16.14.0"]);
+        assert_eq!(names(false), ["16.14.0+vector@0.16.105", "/p [abcd1234]"]);
+        assert_eq!(
+            names(true),
+            ["16.14.0+vector@0.16.105", "/p [abcd1234]", "16.14.0"]
+        );
     }
 
     #[test]
@@ -258,6 +290,7 @@ mod tests {
                 ..entry("16.14.0", false)
             }],
             variants: vec![recent],
+            seeds: vec![],
             instances: vec![],
             total_bytes: 0,
         };

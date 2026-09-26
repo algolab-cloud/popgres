@@ -58,6 +58,9 @@ the `seed` hook — a `.sql` file or a shell command — runs after a fresh
 5. **Expiry and global cleanup.** Optional `--ttl`/`ttl` deadlines persisted in
    state, plus a lock-safe `popgres gc` sweep that disposes only expired
    instances and honors kept data.
+6. **Speed.** `fast = true` and `[settings]` for server configuration, and a
+   seed cache that restores a ready-made, seeded data directory instead of
+   running initdb and the seed on every fresh start.
 
 ## Next
 
