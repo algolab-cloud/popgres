@@ -1216,11 +1216,12 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "popgres"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "libc",
  "postgresql_embedded",
  "postgresql_extensions",
  "rand 0.9.5",

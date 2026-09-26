@@ -85,6 +85,13 @@ Coded exits start at 10 so they can never be confused with a usage error,
 which exits `2`. `run` returns the child command's exit code instead,
 including `128 + signal` when the child is terminated by a signal.
 
+`run` never leaves a database behind on a signal. Ctrl-C (or SIGTERM or
+SIGHUP) while the database is still starting lets startup finish, tears it
+down, and exits `128 + signal` without running the command; a second signal
+exits at once. Once the command is running, a SIGTERM sent to popgres is
+passed on to it, and the command gets 10 seconds to exit before it is killed —
+or none, if you interrupt again.
+
 ## Expiring instances
 
 An instance started with a deadline becomes eligible for disposal even if
@@ -195,7 +202,8 @@ name says what is.
 
 `popgres cache` shows everything popgres keeps on disk — PostgreSQL versions,
 extension variants, and each instance — with what is in use and what is not.
-`popgres cache --clean` removes unused extension variants; adding `--all`
+`popgres cache --clean` removes unused extension variants (anything used in
+the last hour is spared, in case a start is picking it up); adding `--all`
 also removes PostgreSQL versions no popgres instance references (the download
 cache may be shared with other tools built on postgresql-embedded, so this
 step is opt-in). Instance data is never touched — that is what `down` and

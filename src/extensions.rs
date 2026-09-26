@@ -461,28 +461,16 @@ pub fn create_in_database(
     state: &crate::state::InstanceState,
     specs: &[ExtensionSpec],
 ) -> Result<()> {
-    let psql = crate::instance::psql_binary(state)?;
     for spec in specs {
-        let sql = format!("CREATE EXTENSION IF NOT EXISTS \"{}\"", spec.create_as);
-        let output = std::process::Command::new(&psql)
-            .arg(state.url())
-            .args([
-                "--quiet",
-                "--no-psqlrc",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                &sql,
-            ])
-            .output()
-            .with_context(|| format!("failed to run {}", psql.display()))?;
-        if !output.status.success() {
-            bail!(
-                "failed to create extension `{}`: {}",
-                spec.create_as,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        crate::instance::psql_exec(
+            state,
+            &state.database,
+            &format!(
+                "CREATE EXTENSION IF NOT EXISTS {}",
+                crate::instance::quote_identifier(&spec.create_as)
+            ),
+        )
+        .with_context(|| format!("failed to create extension `{}`", spec.create_as))?;
     }
     Ok(())
 }
@@ -517,18 +505,7 @@ fn evict_in(
         if !path.is_dir() {
             continue;
         }
-        // The newer of the folder and its manifest: reuse touches the manifest.
-        let age = [path.clone(), path.join(MANIFEST_FILE)]
-            .iter()
-            .filter_map(|path| {
-                std::fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-            })
-            .filter_map(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|mtime| now.saturating_sub(mtime.as_secs()))
-            .min()
-            .unwrap_or(0);
+        let age = age_secs(&path, now);
         if is_temp(&path) {
             // A crashed build's leftovers; give a live builder a wide berth.
             if age > 24 * 3600 && !dry_run {
@@ -554,6 +531,28 @@ fn evict_in(
     }
     evicted.sort();
     Ok(evicted)
+}
+
+/// Seconds since a store entry was last used: the newer of the folder and
+/// its manifest, which reuse touches.
+fn age_secs(path: &Path, now: u64) -> u64 {
+    [path.to_path_buf(), path.join(MANIFEST_FILE)]
+        .iter()
+        .filter_map(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
+        .filter_map(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|mtime| now.saturating_sub(mtime.as_secs()))
+        .min()
+        .unwrap_or(0)
+}
+
+/// Built or reused within the last hour: possibly by a start whose state
+/// file is not written yet, so nothing may remove it.
+pub fn recently_used(path: &Path) -> bool {
+    age_secs(path, crate::state::now_unix()) < EVICT_MIN_AGE_SECS
 }
 
 fn is_temp(path: &Path) -> bool {

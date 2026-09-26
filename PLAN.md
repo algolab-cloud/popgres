@@ -52,7 +52,9 @@ the `seed` hook — a `.sql` file or a shell command — runs after a fresh
    `--pg <version>` selection.
 4. **Safe automation.** Verified postmaster liveness, serialized lifecycle
    transitions, private credential state, failure-safe cleanup, JSON output on
-   every command, stable exit codes, and child signal exit propagation.
+   every command, stable exit codes, child signal exit propagation, SIGTERM
+   forwarding to `run`'s child, and teardown for signals received during
+   startup.
 5. **Expiry and global cleanup.** Optional `--ttl`/`ttl` deadlines persisted in
    state, plus a lock-safe `popgres gc` sweep that disposes only expired
    instances and honors kept data.
@@ -69,9 +71,6 @@ processes when it forgets to clean up.
 - `popgres sql "select 1"` for one-off queries against a running instance.
 - `popgres mcp` (stdio) exposing the same core as MCP tools, so agents needn't
   shell out at all.
-
-**Teardown.** Forward SIGTERM to the child on signal instead of waiting out the
-grace period and killing it — needs a `libc`/`nix` dependency.
 
 **Distribution.** Wired up in `.github/workflows/release.yml`, triggered by a
 `v*` tag: a build matrix over five targets, a GitHub release with per-target

@@ -1,6 +1,6 @@
 [package]
 name = "popgres"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 # Current postgresql_embedded and SQLx releases require Rust 1.94. Declaring
 # it turns a confusing dependency error on older toolchains into clear guidance.
@@ -27,6 +27,10 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal"] }
 toml = "1.1.4"
+
+[target.'cfg(unix)'.dependencies]
+# Forwarding a SIGTERM to `run`'s child needs kill(2).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -122,7 +122,9 @@ alone. JSON-mode errors are written to stderr. Exit code 10 means `up` adopted
 an existing instance; exit code 11 means a requested port is busy; exit code
 12 means no running instance was found; exit code 2 is a usage error from a
 mistyped invocation. `run` propagates the child's code, including 128 plus
-its terminating signal.
+its terminating signal. To stop a `run`, send it one SIGTERM and wait: popgres
+passes it to the command and still tears the database down. A second signal
+skips the grace period (and, during startup, skips teardown).
 
 Treat `url` and JSON fields containing `url` as secrets because a configured
 password may be embedded. Pass connection values through environment

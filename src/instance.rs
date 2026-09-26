@@ -380,9 +380,7 @@ pub fn quote_identifier(identifier: &str) -> String {
 }
 
 fn psql_capture(state: &InstanceState, database: &str, sql: &str) -> Result<String> {
-    let psql = psql_binary(state)?;
-    let output = std::process::Command::new(&psql)
-        .arg(state.url_for(database))
+    let output = psql_command(state, database)?
         .args([
             "--quiet",
             "--no-psqlrc",
@@ -394,7 +392,7 @@ fn psql_capture(state: &InstanceState, database: &str, sql: &str) -> Result<Stri
             sql,
         ])
         .output()
-        .with_context(|| format!("failed to run {}", psql.display()))?;
+        .context("failed to run psql")?;
     if !output.status.success() {
         bail!(
             "psql failed: {}",
@@ -450,6 +448,7 @@ async fn start_locked(
                 }
             }
             Liveness::Running => {
+                ensure_running_matches(existing, port, pg.as_deref())?;
                 // A new ttl on an `up` for a running instance re-arms it;
                 // without one the existing deadline stands.
                 let state = if expires_at.is_some() && expires_at != existing.expires_at {
@@ -885,6 +884,34 @@ fn read_postmaster_pid(data_dir: &Path) -> Result<u32> {
         .with_context(|| format!("invalid postmaster PID in {}", path.display()))
 }
 
+/// A running instance is reused as it is, so a port or version it cannot
+/// satisfy must fail loudly rather than quietly hand back something else.
+fn ensure_running_matches(
+    existing: &InstanceState,
+    port: Option<u16>,
+    requested: Option<&str>,
+) -> Result<()> {
+    if let Some(port) = port.filter(|port| *port != existing.port) {
+        bail!(
+            "this project's instance is already running on port {}, not {port} — \
+             stop it with `popgres down` to start again on another port",
+            existing.port
+        );
+    }
+    if let Some(requested) = requested {
+        let requirement = VersionReq::from_str(requested)
+            .with_context(|| format!("invalid Postgres version requirement: {requested}"))?;
+        let running = existing.pg_version.trim_start_matches('=');
+        if Version::parse(running).is_ok_and(|running| !requirement.matches(&running)) {
+            bail!(
+                "this project's instance is already running PostgreSQL {running}, but \
+                 `{requested}` was requested — stop it with `popgres down` to switch versions"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A kept data directory must agree with the saved state, and with the
 /// requested version when there is one. The consistency half runs on every
 /// resume — a mismatch otherwise surfaces as Postgres's raw "database files
@@ -963,8 +990,25 @@ pub fn instance_env(state: &InstanceState) -> Vec<(&'static str, String)> {
     env
 }
 
+/// The instance's own `psql`, connected to `database`.
+///
+/// The password travels in `PGPASSWORD`, never on the command line, where
+/// every user on the machine could read it from the process list.
+pub fn psql_command(state: &InstanceState, database: &str) -> Result<std::process::Command> {
+    let mut command = std::process::Command::new(psql_binary(state)?);
+    let without_password = InstanceState {
+        password: String::new(),
+        ..state.clone()
+    };
+    command.arg(without_password.url_for(database));
+    if !state.password.is_empty() {
+        command.env("PGPASSWORD", &state.password);
+    }
+    Ok(command)
+}
+
 /// The `psql` shipped alongside the cached server binaries.
-pub fn psql_binary(state: &InstanceState) -> Result<PathBuf> {
+fn psql_binary(state: &InstanceState) -> Result<PathBuf> {
     let binary = installation_binary(state, "psql");
     if !binary.exists() {
         bail!(
@@ -1113,6 +1157,21 @@ mod tests {
     }
 
     #[test]
+    fn a_running_instance_must_satisfy_the_requested_port_and_version() {
+        let state = sample();
+        ensure_running_matches(&state, None, None).unwrap();
+        ensure_running_matches(&state, Some(state.port), Some("18")).unwrap();
+        ensure_running_matches(&state, None, Some("=18.4.0")).unwrap();
+
+        let error = ensure_running_matches(&state, Some(5555), None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("running on port 54329, not 5555"));
+        let error = ensure_running_matches(&state, None, Some("16")).unwrap_err();
+        assert!(error.to_string().contains("running PostgreSQL 18.4.0"));
+    }
+
+    #[test]
     fn resuming_rejects_a_different_postgres_major() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PG_VERSION"), "18\n").unwrap();
@@ -1160,6 +1219,30 @@ mod tests {
             env.iter().find(|(key, _)| *key == "PGPASSWORD").unwrap().1,
             "hunter2"
         );
+    }
+
+    #[test]
+    fn psql_gets_the_password_from_the_environment_not_argv() {
+        let install = tempfile::tempdir().unwrap();
+        let bin = install.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join(if cfg!(windows) { "psql.exe" } else { "psql" }),
+            "",
+        )
+        .unwrap();
+        let state = InstanceState {
+            installation_dir: install.path().display().to_string(),
+            password: "hunter2".to_string(),
+            ..sample()
+        };
+
+        let command = psql_command(&state, "other").unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["postgresql://postgres@127.0.0.1:54329/other"]);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "PGPASSWORD" && value == Some("hunter2".as_ref())));
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub struct PoolEntry {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub referenced: bool,
+    /// Touched within the last hour — possibly by a start whose state file
+    /// is not written yet, so `--clean` leaves it alone like `gc` does.
+    pub recently_used: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +72,7 @@ impl Report {
                     size_bytes: dir_size(dir),
                     // Instance state is never cache; it is the database.
                     referenced: true,
+                    recently_used: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -87,17 +91,13 @@ impl Report {
         })
     }
 
-    /// Everything `--clean` would remove: unreferenced variants always,
-    /// unreferenced base installs only with `--all`.
+    /// Everything `--clean` would remove: unused variants always, unused
+    /// base installs only with `--all`. Recently used entries never.
     pub fn removable(&self, all: bool) -> Vec<&PoolEntry> {
         self.variants
             .iter()
-            .filter(|entry| !entry.referenced)
-            .chain(
-                self.postgres
-                    .iter()
-                    .filter(|entry| all && !entry.referenced),
-            )
+            .chain(self.postgres.iter().filter(|_| all))
+            .filter(|entry| !entry.referenced && !entry.recently_used)
             .collect()
     }
 }
@@ -140,6 +140,7 @@ fn pool(root: &Path, referenced: impl Fn(&Path) -> bool) -> Result<Vec<PoolEntry
         }
         entries.push(PoolEntry {
             referenced: referenced(&path),
+            recently_used: crate::extensions::recently_used(&path),
             size_bytes: dir_size(&path),
             name,
             path,
@@ -245,12 +246,31 @@ mod tests {
         assert_eq!(names(true), ["16.14.0+vector@0.16.105", "16.14.0"]);
     }
 
+    #[test]
+    fn recently_used_entries_are_never_removable() {
+        let recent = PoolEntry {
+            recently_used: true,
+            ..entry("16.14.0+vector@0.8.0", false)
+        };
+        let report = Report {
+            postgres: vec![PoolEntry {
+                recently_used: true,
+                ..entry("16.14.0", false)
+            }],
+            variants: vec![recent],
+            instances: vec![],
+            total_bytes: 0,
+        };
+        assert!(report.removable(true).is_empty());
+    }
+
     fn entry(name: &str, referenced: bool) -> PoolEntry {
         PoolEntry {
             name: name.to_string(),
             path: PathBuf::from("/nonexistent").join(name),
             size_bytes: 1,
             referenced,
+            recently_used: false,
         }
     }
 }
