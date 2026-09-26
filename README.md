@@ -11,17 +11,26 @@ Popgres starts a real PostgreSQL instance, sets `DATABASE_URL` and the standard
 `PG*` variables for your command, then stops and wipes the database when the
 command exits. PostgreSQL binaries are downloaded on first use and cached.
 
-## Why popgres
+## Features
 
 - **Real PostgreSQL.** Test against the same database engine you deploy, not an
   in-memory substitute.
 - **No Docker daemon.** Popgres downloads a platform binary once and runs it as
   an ordinary local process.
 - **Scoped cleanup.** `run` owns the database lifecycle, including command
-  failures and signals.
+  failures and signals: Ctrl-C or SIGTERM never leaves a database behind.
+- **Fast fresh starts.** The [seed cache](#seed-cache) turns initdb plus
+  your seed into a copy of a ready-made database, so a fresh `run` takes
+  about half a second.
+- **Tuned for tests.** [`fast = true`](#faster-tests) drops durability you
+  don't need for throwaway data, and `[settings]` takes any server setting.
+- **Isolated parallel tests.** [`popgres testdb`](#test-databases-for-parallel-workers)
+  clones a private, fully seeded database per test worker in about 0.1 s.
+- **Extensions included.** The ~46 contrib [extensions](#extensions) cost
+  nothing extra, and pgvector is one line of config.
 - **Safe unattended use.** JSON output, stable exit codes, per-project locking,
   verified liveness, optional TTLs, and global garbage collection support CI
-  jobs and AI agents.
+  jobs and [AI agents](#ai-agents).
 
 ## Install
 
@@ -59,7 +68,7 @@ Windows x64. Standalone archives are available on
 | `popgres url` | Print its connection URL |
 | `popgres psql` | Open a `psql` shell |
 | `popgres testdb` | Clone a disposable test database from the seeded template |
-| `popgres reset` | Wipe and recreate the database |
+| `popgres reset` | Recreate the database from its seed (fast when the seed is unchanged) |
 | `popgres down` | Stop and wipe the database |
 | `popgres down --keep` | Stop and preserve its data |
 | `popgres list` | List every instance on this machine |
@@ -139,6 +148,24 @@ fast = true              # trade durability for speed (see below)
 max_connections = 200
 log_statement = "all"
 ```
+
+### Seeding
+
+`seed` runs once after each fresh initialization, never over data resumed
+with `keep = true`. It is either a `.sql` file, run through the instance's
+own `psql`, or a shell command run from the project root with
+`DATABASE_URL` and the `PG*` variables set:
+
+```toml
+seed = "db/seed.sql"
+# or
+seed = "npx prisma migrate reset --force --skip-generate"
+```
+
+The seed runs against the template database, which popgres then locks and
+clones your working database from. Everything it creates reaches every
+`testdb` clone, and `reset` can rebuild in a clone's time. A failed seed
+leaves `up`'s instance running so you can inspect it; `run` tears it down.
 
 ### Faster tests
 
@@ -253,6 +280,29 @@ cache may be shared with other tools built on postgresql-embedded, so this
 step is opt-in). Instance data is never touched — that is what `down` and
 `gc` are for.
 
+## Continuous integration
+
+`popgres run` needs nothing but the binary, so it drops into any CI job. To
+make fresh starts fast there too, cache the PostgreSQL download and
+popgres's seed cache between runs. On a GitHub Actions Linux runner:
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.theseus/postgresql
+      ~/.local/share/popgres/seeds
+      ~/.local/share/popgres/variants
+    key: popgres-${{ runner.os }}-${{ hashFiles('popgres.toml', 'db/**') }}
+    restore-keys: popgres-${{ runner.os }}-
+- run: npx @popgres/cli run -- npm test
+```
+
+Without the cache, each job downloads PostgreSQL once and pays for initdb
+and the seed as usual. For a database shared by several steps, start it with
+`popgres up --ttl 30m` and finish with `popgres down` (or `popgres gc`), so
+a cancelled job can't leave it running.
+
 ## Where the database lives
 
 By default the instance lives in `.popgres/` inside the project, like `.git`
@@ -267,8 +317,26 @@ an existing global instance keep using it until it is wiped; the next fresh
 start is local.
 
 The default instance is passwordless and listens only on loopback. Set
-`password` in `popgres.toml` when authentication is required. Keep configured
-environment files out of version control.
+`password` in `popgres.toml` when authentication is required. Popgres passes
+it to its own `psql` calls through `PGPASSWORD`, never on the command line
+where other users could see it, and percent-encodes it in connection URLs.
+Keep configured environment files out of version control.
+
+## Troubleshooting
+
+**`error while loading shared libraries: libxml2.so.2`.** The official
+PostgreSQL builds link against libxml2 2.13 or older. Distributions that
+ship libxml2 2.14+ (such as Arch Linux) no longer provide `libxml2.so.2`.
+Install your distribution's libxml2 compatibility package (on Arch,
+`libxml2-legacy` from the AUR), then run the command again.
+
+**`the instance is already running … but … was requested`.** `up` and `run`
+reuse a running instance and won't quietly hand back one with a different
+`--pg` or `--port`. Stop it with `popgres down` first.
+
+**`waiting for another popgres process to finish`.** Another popgres command
+holds this project's lock, often while downloading PostgreSQL or running a
+seed. It continues on its own once the lock is released.
 
 ## AI agents
 
