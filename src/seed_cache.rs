@@ -488,31 +488,39 @@ mod tests {
             )
             .unwrap();
         };
-        for key in ["a", "b", "c", "d"] {
+        // Distinct ages, oldest first: entries stored within one second
+        // would otherwise tie, and their order is up to the filesystem.
+        let now = crate::state::now_unix();
+        for (offset, key) in [40, 30, 20, 10].into_iter().zip(["a", "b", "c", "d"]) {
             store_in(key, "/p");
+            std::fs::File::options()
+                .write(true)
+                .open(root.path().join(key).join(MANIFEST_FILE))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - offset))
+                .unwrap();
         }
         store_in("other", "/q");
+        let keys = |at| -> Vec<String> {
+            entries_in(root.path(), at)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect()
+        };
 
         // Everything is recent, so pruning spares it all…
-        prune_project(root.path(), "/p", &[], crate::state::now_unix());
-        assert_eq!(
-            entries_in(root.path(), crate::state::now_unix())
-                .unwrap()
-                .len(),
-            5
-        );
-        // …but minutes on, only the project's newest three (plus anything
-        // referenced) survive, and other projects are untouched.
-        let later = crate::state::now_unix() + COPY_GUARD_SECS + 10;
-        prune_project(root.path(), "/p", &["d".to_string()], later);
-        let left: Vec<_> = entries_in(root.path(), later)
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.key)
-            .collect();
-        assert_eq!(left.len(), 4, "{left:?}");
-        assert!(left.contains(&"other".to_string()));
-        assert!(left.contains(&"d".to_string()));
+        prune_project(root.path(), "/p", &[], now);
+        assert_eq!(keys(now).len(), 5);
+        // …and minutes on, a referenced entry still survives beyond the
+        // newest three…
+        let later = now + COPY_GUARD_SECS + 60;
+        prune_project(root.path(), "/p", &["a".to_string()], later);
+        assert_eq!(keys(later).len(), 5);
+        // …but an unreferenced one goes, and other projects are untouched.
+        prune_project(root.path(), "/p", &[], later);
+        let left = keys(later);
+        assert_eq!(left, ["other", "d", "c", "b"], "newest first");
 
         // A week on, gc evicts whatever nothing references.
         let week = crate::state::now_unix() + EVICT_AFTER_SECS + 10;
